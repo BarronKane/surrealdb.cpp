@@ -1,0 +1,14 @@
+﻿# Build Directories.
+build/
+cmake-build-debug/
+cmake-build/release
+
+# IDEs
+.idea/
+.vscode/
+
+# For now this is a blind subdirectory.
+# This will change later to one of the following:
+# - Git submodule
+# - CMake External Project
+surrealdb.c/
