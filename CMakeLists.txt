@@ -2,6 +2,45 @@ cmake_minimum_required(VERSION 3.31.11) # I'm using 4+, but C23/CXX23 fixes here
 project(surrealdb_cpp VERSION 0.1.0 LANGUAGES C CXX)
 
 # ============================================================================
+# Git Submodules
+# ============================================================================
+
+find_package(Git QUIET)
+if(GIT_FOUND AND EXISTS "${PROJECT_SOURCE_DIR}/.git")
+    option(GIT_SUBMODULE "Check submodules during build" ON)
+    if(GIT_SUBMODULE)
+        message(STATUS "Updating git submodules...")
+        execute_process(COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
+                        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                        RESULT_VARIABLE GIT_SUBMOD_RESULT)
+        if(NOT GIT_SUBMOD_RESULT EQUAL "0")
+            message(FATAL_ERROR "git submodule update --init --recursive failed with ${GIT_SUBMOD_RESULT}, please checkout submodules")
+        endif()
+    endif()
+endif()
+
+# Verify submodules are present
+if(NOT EXISTS "${PROJECT_SOURCE_DIR}/surrealdb.c/CMakeLists.txt")
+    message(FATAL_ERROR "The surrealdb.c submodule was not downloaded! GIT_SUBMODULE was turned off or failed. Please update submodules and try again.")
+endif()
+
+if(NOT EXISTS "${PROJECT_SOURCE_DIR}/ThirdParty/Unity/CMakeLists.txt")
+    message(FATAL_ERROR "The Unity submodule was not downloaded! GIT_SUBMODULE was turned off or failed. Please update submodules and try again.")
+endif()
+
+# ============================================================================
+# User Options
+# ============================================================================
+
+# Build options
+option(BUILD_TESTING "Build tests." ON)
+option(SURREALDB_RELEASE "Build Rust library in release mode" OFF)
+option(SURREALDB_USE_MODULES "Enable C++ modules for surrealdb_cpp" OFF)
+
+# Static/Shared - On for default for now for testing.
+option(BUILD_SHARED "Build shared library .dll/.so/.dylib)" ON)
+
+# ============================================================================
 # Project Configuration
 # ============================================================================
 
@@ -11,10 +50,6 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF) # -std=c++xx instead of -std=gnu++xx
-
-# Build options
-option(BUILD_TESTING "Build tests." ON)
-option(SURREALDB_RELEASE "Build Rust library in release mode" OFF)
 
 # Make custom find modules available
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -47,7 +82,7 @@ if(WIN32 OR MSVC)
             # which is off by default, and enforce macro reporting for version.
             # Classically, these are off for backwards compatability.
             " /Zc:__cplusplus "
-            " /std:c++23 "
+            #" /std:c++23 " # This actually doesn't exist in MSVC atm, needs exploring.
     )
 endif(WIN32 OR MSVC)
 
@@ -64,27 +99,30 @@ find_package(Surrealdb.c REQUIRED)
 # Project structure.
 # ============================================================================
 
-
+add_subdirectory_with_folder("surrealdb.cpp" src/surreal.cpp)
 
 # ============================================================================
-# Tests (Unity from surrealdb.c)
+# Tests (Unity)
 # ============================================================================
 
 if(BUILD_TESTING)
     enable_testing()
 
-    set(_unity_dir "${SURREALDB_C_SOURCE_DIR}/ThirdParty/Unity")
-    if(EXISTS "${_unity_dir}/CMakeLists.txt")
-        set(UNITY_EXTENSION_FIXTURE ON CACHE BOOL "Enable Unity Fixture extension" FORCE)
-        if(NOT TARGET unity)
-            add_subdirectory("${_unity_dir}" "${CMAKE_BINARY_DIR}/ThirdParty/Unity-build")
-        endif()
-        if(TARGET unity AND NOT TARGET Unity::unity)
-            add_library(Unity::unity ALIAS unity)
-        endif()
-    else()
-        message(FATAL_ERROR "Unity not found at: ${_unity_dir}")
-    endif()
+    set(UNITY_USE_SYSTEM OFF CACHE BOOL "Use a system-installed Unity if available" FORCE)
+    find_package(Unity REQUIRED MODULE)
 
     add_subdirectory(tests)
+endif()
+
+# ============================================================================
+# Examples
+# ============================================================================
+
+option(BUILD_EXAMPLES "Build examples" ON)
+
+if(BUILD_EXAMPLES)
+    add_subdirectory(examples/no_modules)
+    if(SURREALDB_USE_MODULES)
+        add_subdirectory(examples/modules)
+    endif()
 endif()

@@ -1,0 +1,9 @@
+[submodule "surrealdb.c"]
+	path = surrealdb.c
+	url = https://github.com/BarronKane/surrealdb.c.git
+	branch = dev-iteration
+[submodule "ThirdParty/Unity"]
+	path = ThirdParty/Unity
+	url = git@github.com:ThrowTheSwitch/Unity.git
+	branch = v2.6.1
+
