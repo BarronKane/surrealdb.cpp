@@ -3,6 +3,6 @@
 #include <surrealdb/surrealdb.hpp>
 export module surrealdb;
 
-export import :internal;
-
-export using ::hello_surreal;
+export namespace surrealdb {
+    using ::surrealdb::connection;
+}

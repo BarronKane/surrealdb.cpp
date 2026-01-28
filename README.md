@@ -6,7 +6,7 @@ A C++23 wrapper for the SurrealDB C library, supporting both traditional headers
 
 - CMake 3.31.11 or higher
 - C++23 compatible compiler (MSVC 19.x, GCC 14+, Clang 18+)
-- For C++20 modules: Visual Studio 18 2026 or Ninja generator
+- For the full feature set (C++20 modules): Visual Studio 18 2026 generator
 
 ## Build Options
 
@@ -41,9 +41,9 @@ cmake --build build --target surrealdb_cpp_no_modules_example
 
 ### Example with Modules (C++20 Modules)
 
-C++20 modules require a compatible generator. Use **Visual Studio 17 2022** or **Ninja**.
+C++20 modules require a compatible generator. Use **Visual Studio 18 2026** for the full feature set.
 
-#### Using Visual Studio 17 2022 (Windows)
+#### Using Visual Studio 18 2026 (Windows)
 
 ```bash
 # Configure
@@ -56,7 +56,7 @@ cmake --build build --target surrealdb_cpp_modules_example --config Debug
 .\build\bin\Debug\surrealdb_cpp_modules_example.exe
 ```
 
-#### Using Ninja
+#### Using Ninja (limited feature set)
 
 ```bash
 # Configure
@@ -80,7 +80,12 @@ cmake --build build --target surrealdb_cpp_modules_example
 #include <surrealdb/surrealdb.hpp>
 
 int main() {
-    return hello_surreal();
+    surrealdb::connection db;
+    if (!db.connect("mem://")) {
+        return 1;
+    }
+    const char* version = db.version();
+    return version && version[0] != '\0' ? 0 : 1;
 }
 ```
 
@@ -90,7 +95,12 @@ int main() {
 import surrealdb;
 
 int main() {
-    return hello_surreal();
+    surrealdb::connection db;
+    if (!db.connect("mem://")) {
+        return 1;
+    }
+    const char* version = db.version();
+    return version && version[0] != '\0' ? 0 : 1;
 }
 ```
 
@@ -116,4 +126,5 @@ The library is designed with modern C++23 patterns, supporting:
 
 - The `SURREALDB_USE_MODULES` preprocessor define controls whether to use `import surrealdb;` or `#include <surrealdb/surrealdb.hpp>`
 - NMake Makefiles generator does **not** support C++20 modules
+- MinGW builds produce `.a` static libraries instead of `.lib`
 - Both examples produce the same output: `Surrealdb server version: X.X.X`

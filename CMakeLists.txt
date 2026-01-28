@@ -40,6 +40,19 @@ option(SURREALDB_USE_MODULES "Enable C++ modules for surrealdb_cpp" OFF)
 # Static/Shared - On for default for now for testing.
 option(BUILD_SHARED "Build shared library .dll/.so/.dylib)" ON)
 
+# Toolchain notes
+if(SURREALDB_USE_MODULES)
+    if(MSVC AND NOT CMAKE_GENERATOR MATCHES "Visual Studio 18 2026")
+        message(WARNING "SURREALDB_USE_MODULES is ON. Full feature support requires the Visual Studio 18 2026 generator (current: ${CMAKE_GENERATOR}).")
+    elseif(NOT MSVC)
+        message(STATUS "SURREALDB_USE_MODULES is ON with a non-MSVC toolchain; module support may be limited.")
+    endif()
+endif()
+
+if(MINGW)
+    message(STATUS "MinGW builds produce .a static libraries instead of .lib.")
+endif()
+
 # ============================================================================
 # Project Configuration
 # ============================================================================
@@ -69,7 +82,7 @@ set(CMAKE_INCLUDE_CURRENT_DIR ON)
 # For compiler options, we can also enable things like static analysis
 # later, as well as many other options. C++ is a large standard
 # so we will tweak only as necessary.
-if(WIN32 OR MSVC)
+if(WIN32)
     # For DLL library definitions.
     set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
@@ -77,6 +90,9 @@ if(WIN32 OR MSVC)
             # This sets the minimum feature set to Windows 7.
             _WIN32_WINNT=0x0601
     )
+endif()
+
+if(MSVC)
     add_definitions(
             # These are needed in windows to activate the __cplusplus macro
             # which is off by default, and enforce macro reporting for version.
@@ -84,7 +100,7 @@ if(WIN32 OR MSVC)
             " /Zc:__cplusplus "
             #" /std:c++23 " # This actually doesn't exist in MSVC atm, needs exploring.
     )
-endif(WIN32 OR MSVC)
+endif()
 
 # Platform agnostic installation trees.
 include(GNUInstallDirs)

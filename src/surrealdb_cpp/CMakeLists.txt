@@ -18,16 +18,20 @@ generate_export_header(${SURREALDB_CPP_TARGET}
 
 set(SDB_PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include/surrealdb/surrealdb.hpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/surrealdb/api/api.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/surrealdb/connection.hpp
 
     # DLL export header.
     ${CMAKE_CURRENT_BINARY_DIR}/surrealdb_cpp_export.h
 )
 
+set(_sdb_module_interface
+    ${CMAKE_CURRENT_SOURCE_DIR}/modules/surrealdb.cppm
+)
+
 
 target_sources(${SURREALDB_CPP_TARGET}
     PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/private/hello_surreal.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/private/connection.cpp
     PUBLIC
         FILE_SET public_headers TYPE HEADERS
         BASE_DIRS
@@ -44,11 +48,30 @@ if(SURREALDB_USE_MODULES)
             BASE_DIRS
                 ${CMAKE_CURRENT_SOURCE_DIR}/modules
             FILES
-                ${CMAKE_CURRENT_SOURCE_DIR}/modules/surrealdb/surrealdb.cppm
-                ${CMAKE_CURRENT_SOURCE_DIR}/modules/surrealdb/internal.cppm
+                ${_sdb_module_interface}
     )
     target_compile_definitions(${SURREALDB_CPP_TARGET} PRIVATE SURREALDB_USE_MODULES=1)
     set_target_properties(${SURREALDB_CPP_TARGET} PROPERTIES CXX_SCAN_FOR_MODULES ON)
+endif()
+
+option(SURREALDB_IDE_MODULE_SOURCES "Include module sources in IDEs when modules are disabled" ON)
+if(SURREALDB_IDE_MODULE_SOURCES AND NOT SURREALDB_USE_MODULES)
+    add_library(surrealdb_cpp_module_iface OBJECT EXCLUDE_FROM_ALL)
+    target_sources(surrealdb_cpp_module_iface
+        PUBLIC
+            FILE_SET cxx_modules TYPE CXX_MODULES
+            BASE_DIRS
+                ${CMAKE_CURRENT_SOURCE_DIR}/modules
+            FILES
+                ${_sdb_module_interface}
+    )
+    target_include_directories(surrealdb_cpp_module_iface
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_BINARY_DIR}
+    )
+    target_compile_features(surrealdb_cpp_module_iface PRIVATE cxx_std_23)
+    set_target_properties(surrealdb_cpp_module_iface PROPERTIES CXX_SCAN_FOR_MODULES ON)
 endif()
 
 target_include_directories(${SURREALDB_CPP_TARGET}
