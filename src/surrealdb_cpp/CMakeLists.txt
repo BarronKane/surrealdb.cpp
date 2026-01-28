@@ -16,9 +16,16 @@ generate_export_header(${SURREALDB_CPP_TARGET}
     EXPORT_FILE_NAME "${CMAKE_CURRENT_BINARY_DIR}/surrealdb_cpp_export.h"
 )
 
+set(SDB_PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/private/connection.cpp
+)
+
 set(SDB_PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include/surrealdb/surrealdb.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/include/surrealdb/connection.hpp
+
+    # Types
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/surrealdb/types/result.hpp
 
     # DLL export header.
     ${CMAKE_CURRENT_BINARY_DIR}/surrealdb_cpp_export.h
@@ -31,7 +38,7 @@ set(_sdb_module_interface
 
 target_sources(${SURREALDB_CPP_TARGET}
     PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/private/connection.cpp
+        ${SDB_PRIVATE}
     PUBLIC
         FILE_SET public_headers TYPE HEADERS
         BASE_DIRS

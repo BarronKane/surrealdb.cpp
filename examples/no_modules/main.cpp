@@ -6,17 +6,18 @@ int main()
     surrealdb::connection db;
     if (!db.connect("mem://"))
     {
-        std::printf("Connection failed: %s\n", db.last_error());
+        std::printf("Connection failed: %s\n", db.last_error().c_str());
         return 1;
     }
 
-    const char* version = db.version();
-    if (!version || version[0] == '\0')
+    const auto version = db.version();
+    if (!version || version->empty())
     {
-        std::printf("Failed to get db version: %s\n", db.last_error());
+        const auto message = version ? db.last_error() : version.error().message;
+        std::printf("Failed to get db version: %s\n", message.c_str());
         return 1;
     }
 
-    std::printf("Surrealdb server version: %s\n", version);
+    std::printf("Surrealdb server version: %s\n", version->c_str());
     return 0;
 }

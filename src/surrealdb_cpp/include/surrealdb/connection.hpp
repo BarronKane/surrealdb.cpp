@@ -1,5 +1,8 @@
-#ifndef SURREALDB_CONNECTION_HPP
-#define SURREALDB_CONNECTION_HPP
+#pragma once
+
+#include <string>
+
+#include "types/result.hpp"
 
 #include <surrealdb_cpp_export.h>
 
@@ -10,6 +13,7 @@ namespace surrealdb {
 class SURREALDB_CPP_EXPORT connection {
 
 public:
+
     connection() noexcept;
     explicit connection(const char* endpoint);
     ~connection();
@@ -23,19 +27,21 @@ public:
     void disconnect() noexcept;
     bool is_connected() const noexcept;
 
-    const char* version();
-    const char* last_error() const noexcept;
+    [[nodiscard]]
+    result<std::string> version();
+    [[nodiscard]]
+    std::string last_error() const noexcept;
+    [[nodiscard]]
     sr_surreal_t* native_handle() const noexcept;
 
 private:
+
     void clear_error() noexcept;
     void clear_version() noexcept;
 
     sr_surreal_t* db_;
-    char* last_error_;
-    char* last_version_;
+    std::string last_error_;
+    std::string last_version_;
 };
 
 }
-
-#endif // SURREALDB_CONNECTION_HPP

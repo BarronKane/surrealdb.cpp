@@ -1,4 +1,5 @@
 #include <surrealdb/connection.hpp>
+#include <utility>
 
 extern "C" {
 #include <surrealdb.h>
@@ -7,7 +8,7 @@ extern "C" {
 namespace surrealdb {
 
 connection::connection() noexcept
-    : db_(nullptr), last_error_(nullptr), last_version_(nullptr)
+    : db_(nullptr)
 {
 }
 
@@ -26,12 +27,10 @@ connection::~connection()
 
 connection::connection(connection&& other) noexcept
     : db_(other.db_),
-      last_error_(other.last_error_),
-      last_version_(other.last_version_)
+      last_error_(std::move(other.last_error_)),
+      last_version_(std::move(other.last_version_))
 {
     other.db_ = nullptr;
-    other.last_error_ = nullptr;
-    other.last_version_ = nullptr;
 }
 
 connection& connection::operator=(connection&& other) noexcept
@@ -43,12 +42,10 @@ connection& connection::operator=(connection&& other) noexcept
         clear_error();
 
         db_ = other.db_;
-        last_error_ = other.last_error_;
-        last_version_ = other.last_version_;
+        last_error_ = std::move(other.last_error_);
+        last_version_ = std::move(other.last_version_);
 
         other.db_ = nullptr;
-        other.last_error_ = nullptr;
-        other.last_version_ = nullptr;
     }
     return *this;
 }
@@ -64,7 +61,11 @@ bool connection::connect(const char* endpoint)
 
     if (sr_connect(&err, &db, endpoint) < 0)
     {
-        last_error_ = err;
+        if (err)
+        {
+            last_error_ = err;
+            sr_free_string(err);
+        }
         return false;
     }
 
@@ -91,7 +92,7 @@ bool connection::is_connected() const noexcept
     return db_ != nullptr;
 }
 
-const char* connection::version()
+result<std::string> connection::version()
 {
     clear_version();
     clear_error();
@@ -104,28 +105,42 @@ const char* connection::version()
     sr_string_t err = nullptr;
     sr_string_t ver = nullptr;
 
-    if (sr_version(db_, &err, &ver) < 0)
+    if (const int e = sr_version(db_, &err, &ver); e < 0)
     {
-        last_error_ = err;
+        if (err)
+        {
+            last_error_ = err;
+            sr_free_string(err);
+        }
         if (ver)
         {
             sr_free_string(ver);
         }
-        return "";
+        return make_error<std::string>(e, last_error_);
     }
 
+    // This should never fire, but leaving for the moment.
     if (err)
     {
         sr_free_string(err);
     }
 
-    last_version_ = ver;
-    return last_version_ ? last_version_ : "";
+    if (ver)
+    {
+        last_version_ = ver;
+        sr_free_string(ver);
+    }
+    else
+    {
+        last_version_.clear();
+    }
+
+    return last_version_;
 }
 
-const char* connection::last_error() const noexcept
+std::string connection::last_error() const noexcept
 {
-    return last_error_ ? last_error_ : "";
+    return last_error_;
 }
 
 sr_surreal_t* connection::native_handle() const noexcept
@@ -135,20 +150,12 @@ sr_surreal_t* connection::native_handle() const noexcept
 
 void connection::clear_error() noexcept
 {
-    if (last_error_)
-    {
-        sr_free_string(last_error_);
-        last_error_ = nullptr;
-    }
+    last_error_.clear();
 }
 
 void connection::clear_version() noexcept
 {
-    if (last_version_)
-    {
-        sr_free_string(last_version_);
-        last_version_ = nullptr;
-    }
+    last_version_.clear();
 }
 
 } // namespace surrealdb
