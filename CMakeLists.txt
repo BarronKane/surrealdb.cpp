@@ -99,7 +99,7 @@ find_package(Surrealdb.c REQUIRED)
 # Project structure.
 # ============================================================================
 
-add_subdirectory_with_folder("surrealdb.cpp" src/surreal.cpp)
+add_subdirectory_with_folder("surrealdb.cpp" src/surrealdb_cpp)
 
 # ============================================================================
 # Tests (Unity)

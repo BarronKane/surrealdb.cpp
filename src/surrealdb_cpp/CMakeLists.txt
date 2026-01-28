@@ -16,29 +16,22 @@ generate_export_header(${SURREALDB_CPP_TARGET}
     EXPORT_FILE_NAME "${CMAKE_CURRENT_BINARY_DIR}/surrealdb_cpp_export.h"
 )
 
-set(SDB_PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/private/surrealdb/surrealdb.cpp
-)
 set(SDB_PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/public/surrealdb/surrealdb.hpp
-
-    ${CMAKE_CURRENT_SOURCE_DIR}/public/surrealdb/api/api.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/surrealdb/surrealdb.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/surrealdb/api/api.hpp
 
     # DLL export header.
     ${CMAKE_CURRENT_BINARY_DIR}/surrealdb_cpp_export.h
-)
-set(SDB_MODULES
-    ${CMAKE_CURRENT_SOURCE_DIR}/modules/surrealdb.cppm
 )
 
 
 target_sources(${SURREALDB_CPP_TARGET}
     PRIVATE
-        ${SDB_PRIVATE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/private/hello_surreal.cpp
     PUBLIC
         FILE_SET public_headers TYPE HEADERS
         BASE_DIRS
-            ${CMAKE_CURRENT_SOURCE_DIR}/public
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
             ${CMAKE_CURRENT_BINARY_DIR}
         FILES
             ${SDB_PUBLIC}
@@ -51,14 +44,16 @@ if(SURREALDB_USE_MODULES)
             BASE_DIRS
                 ${CMAKE_CURRENT_SOURCE_DIR}/modules
             FILES
-                ${SDB_MODULES}
+                ${CMAKE_CURRENT_SOURCE_DIR}/modules/surrealdb/surrealdb.cppm
+                ${CMAKE_CURRENT_SOURCE_DIR}/modules/surrealdb/internal.cppm
     )
+    target_compile_definitions(${SURREALDB_CPP_TARGET} PRIVATE SURREALDB_USE_MODULES=1)
     set_target_properties(${SURREALDB_CPP_TARGET} PROPERTIES CXX_SCAN_FOR_MODULES ON)
 endif()
 
 target_include_directories(${SURREALDB_CPP_TARGET}
     PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/public>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE
@@ -84,6 +79,7 @@ endif()
 set_target_properties(${SURREALDB_CPP_TARGET} PROPERTIES
     VERSION ${PROJECT_VERSION}
     SOVERSION ${PROJECT_VERSION_MAJOR}
+    LINKER_LANGUAGE CXX
 )
 
 include(CMakePackageConfigHelpers)

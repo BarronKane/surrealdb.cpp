@@ -105,6 +105,13 @@ set(SURREALDB_USE_MODULES ON)
 target_link_libraries(your_app PRIVATE surrealdb::surrealdb_cpp)
 ```
 
+## Modern C++ Internal Architecture
+
+The library is designed with modern C++23 patterns, supporting:
+- **Module Partitions**: Internal logic is organized into module partitions (e.g., `:internal`), which are kept private from consumers.
+- **Hybrid Implementation**: Source files can be compiled as either C++ module implementation units or traditional translation units, allowing for a single codebase to support both modern and legacy build modes.
+- **`import std;` Compatibility**: The project is configured for C++23, enabling the use of `import std;` in environments where the compiler and build system have it enabled.
+
 ## Notes
 
 - The `SURREALDB_USE_MODULES` preprocessor define controls whether to use `import surrealdb;` or `#include <surrealdb/surrealdb.hpp>`
