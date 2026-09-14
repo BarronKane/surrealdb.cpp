@@ -5,4 +5,14 @@ find_dependency(surrealdb_c CONFIG REQUIRED)
 
 include("${CMAKE_CURRENT_LIST_DIR}/surrealdb_cppTargets.cmake")
 
+# Attach the C library here rather than in the exported target.
+#
+# `surrealdb::surrealdb_c` is an ALIAS in surrealdb.cpp's own build tree, and
+# CMake resolves aliases to their real target name when it writes an export --
+# so linking it there produced `INTERFACE_LINK_LIBRARIES "surrealdb_c"`, which
+# a consumer saw as the bare flag `-lsurrealdb_c` and could not resolve.
+# `find_dependency` above has already defined the namespaced target.
+set_property(TARGET surrealdb::surrealdb_cpp APPEND PROPERTY
+    INTERFACE_LINK_LIBRARIES surrealdb::surrealdb_c)
+
 check_required_components(surrealdb.cpp)

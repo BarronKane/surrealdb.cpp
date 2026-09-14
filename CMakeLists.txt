@@ -1,4 +1,21 @@
 cmake_minimum_required(VERSION 3.31.11) # I'm using 4+, but C23/CXX23 fixes here for ninja codegen.
+
+# Must precede project(): CMake configures the Apple toolchain there and ignores
+# a deployment target set afterwards.
+#
+# surrealdb.c carries this module and includes it before its own project(), but
+# that is too late when this project is the top-level one -- the toolchain is
+# already configured by the time the submodule is added, and every macOS build
+# gets the wall of "built for newer macOS version" linker warnings the module
+# exists to prevent. Reused from the submodule rather than copied, so the logic
+# has one home; skipped silently when the submodule has not been fetched yet,
+# which is the same position a fresh clone is in.
+set(_sdb_apple_module
+    "${CMAKE_CURRENT_LIST_DIR}/surrealdb.c/cmake/AppleDeploymentTarget.cmake")
+if(APPLE AND EXISTS "${_sdb_apple_module}")
+    include("${_sdb_apple_module}")
+endif()
+
 project(surrealdb_cpp VERSION 0.1.0 LANGUAGES C CXX)
 
 # ============================================================================
@@ -13,14 +30,52 @@ else()
 endif()
 
 find_package(Git QUIET)
-if(GIT_FOUND AND EXISTS "${PROJECT_SOURCE_DIR}/.git")
-    if(GIT_SUBMODULE)
-        message(STATUS "Updating git submodules...")
-        execute_process(COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
-                        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-                        RESULT_VARIABLE GIT_SUBMOD_RESULT)
-        if(NOT GIT_SUBMOD_RESULT EQUAL "0")
-            message(WARNING "git submodule update --init --recursive failed with ${GIT_SUBMOD_RESULT}, proceeding to verify submodules exist")
+if(GIT_FOUND AND EXISTS "${PROJECT_SOURCE_DIR}/.git" AND GIT_SUBMODULE)
+    # Only *populate* submodules that are missing. Never update one that is
+    # already checked out.
+    #
+    # `git submodule update --init --recursive` unconditionally resets every
+    # submodule to the commit recorded in this repository's index. Running that
+    # on every configure means merely building surrealdb.cpp silently rewinds a
+    # surrealdb.c checkout to whatever pointer happens to be committed here,
+    # discarding the branch someone is working on. That is not the build
+    # system's call to make, and the failure is quiet: the tree still compiles,
+    # against the wrong library.
+    #
+    # An empty directory is unambiguous -- nothing to lose -- so that case is
+    # initialised and everything else is left alone.
+    foreach(_sub IN ITEMS "surrealdb.c")
+        if(NOT EXISTS "${PROJECT_SOURCE_DIR}/${_sub}/.git")
+            message(STATUS "Initialising submodule: ${_sub}")
+            execute_process(
+                COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive -- "${_sub}"
+                WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                RESULT_VARIABLE _sub_result)
+            if(NOT _sub_result EQUAL "0")
+                message(WARNING "Could not initialise ${_sub} (${_sub_result}); "
+                                "run: git submodule update --init --recursive")
+            endif()
+        endif()
+    endforeach()
+
+    # Say so when the checkout differs from the recorded pointer, rather than
+    # "fixing" it. During development that difference is usually deliberate.
+    execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
+                    WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}/surrealdb.c"
+                    OUTPUT_VARIABLE _sub_head OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET)
+    execute_process(COMMAND ${GIT_EXECUTABLE} ls-files -s surrealdb.c
+                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                    OUTPUT_VARIABLE _sub_recorded OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET)
+    if(_sub_head AND _sub_recorded)
+        # `git ls-files -s` prints "<mode> <sha> <stage>\t<path>"; the mode is
+        # also all digits, so match the second field rather than the first.
+        string(REGEX MATCH "^[0-9]+ ([0-9a-f]+)" _ "${_sub_recorded}")
+        set(_sub_recorded_sha "${CMAKE_MATCH_1}")
+        if(NOT _sub_head STREQUAL _sub_recorded_sha)
+            message(STATUS "surrealdb.c is at ${_sub_head}, "
+                           "this repo records ${_sub_recorded_sha} — building against the checkout.")
         endif()
     endif()
 endif()
@@ -28,10 +83,6 @@ endif()
 # Verify submodules are present
 if(NOT EXISTS "${PROJECT_SOURCE_DIR}/surrealdb.c/CMakeLists.txt")
     message(FATAL_ERROR "The surrealdb.c submodule was not downloaded! GIT_SUBMODULE was turned off or failed. Please update submodules and try again.")
-endif()
-
-if(NOT EXISTS "${PROJECT_SOURCE_DIR}/ThirdParty/Unity/CMakeLists.txt")
-    message(FATAL_ERROR "The Unity submodule was not downloaded! GIT_SUBMODULE was turned off or failed. Please update submodules and try again.")
 endif()
 
 # ============================================================================
@@ -44,7 +95,9 @@ option(SURREALDB_RELEASE "Build Rust library in release mode" OFF)
 option(SURREALDB_USE_MODULES "Enable C++ modules for surrealdb_cpp" OFF)
 
 # Static/Shared - On for default for now for testing.
-option(BUILD_SHARED "Build shared library .dll/.so/.dylib)" ON)
+# surrealdb.cpp is header-only: there is no C++ library to build shared or
+# static, so BUILD_SHARED would have nothing to act on. The Rust library's own
+# artifact kind is decided in its Cargo.toml.
 
 # Toolchain notes
 if(SURREALDB_USE_MODULES)
@@ -63,50 +116,111 @@ endif()
 # Project Configuration
 # ============================================================================
 
-set(CMAKE_C_STANDARD 23)
-set(CMAKE_C_STANDARD_REQUIRED ON)
-
-set(CMAKE_CXX_STANDARD 23)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF) # -std=c++xx instead of -std=gnu++xx
-
-# Make custom find modules available
+# Make custom find modules available. This is additive and safe either way.
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
-# Put binary files on the top level of the build tree for convenience.
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
-# DLLs are runtime for windows.
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+# ----------------------------------------------------------------------------
+# Everything below is a *default*, not a policy.
+# ----------------------------------------------------------------------------
+#
+# A library must not set global CMake state when it is not the project being
+# built. Language standard, extensions, output layout and warning flags all
+# belong to whoever is driving the build -- a toolchain file, a superbuild, or
+# a host with a build system of its own. Setting them here would silently
+# override a
+# host that had already chosen, and the override is invisible: the tree still
+# configures, still builds, and produces objects compiled differently from
+# everything they are about to be linked against.
+#
+# So these apply only when this project is the top-level one, and even then
+# only where the value has not already been supplied. Building surrealdb.cpp
+# directly gets sensible defaults; embedding it changes nothing.
+#
+# See cmake/toolchains/ for driving this from a host toolchain, and
+# docs/embedding.md for what a host is expected to provide.
+
+if(PROJECT_IS_TOP_LEVEL)
+    if(NOT DEFINED CMAKE_C_STANDARD)
+        set(CMAKE_C_STANDARD 17)
+        set(CMAKE_C_STANDARD_REQUIRED ON)
+    endif()
+
+    # C++17 is the floor; newer standards light up more (see config.hpp). Not
+    # pinned: the library target carries cxx_std_17 as an INTERFACE requirement,
+    # which raises a consumer that asked for less and never lowers one that
+    # asked for more.
+    if(NOT DEFINED CMAKE_CXX_STANDARD)
+        set(CMAKE_CXX_STANDARD 17)
+    endif()
+    if(NOT DEFINED CMAKE_CXX_STANDARD_REQUIRED)
+        set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    endif()
+    # -std=c++xx rather than -std=gnu++xx. A host that wants the GNU dialect
+    # sets this itself and is left alone.
+    if(NOT DEFINED CMAKE_CXX_EXTENSIONS)
+        set(CMAKE_CXX_EXTENSIONS OFF)
+    endif()
+
+    # Collect build output in one place, for convenience when working here.
+    if(NOT DEFINED CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+        set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+    endif()
+    if(NOT DEFINED CMAKE_ARCHIVE_OUTPUT_DIRECTORY)
+        set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+    endif()
+    if(NOT DEFINED CMAKE_RUNTIME_OUTPUT_DIRECTORY)
+        set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    endif()
+endif()
 
 # To homogenize folders in IDEs.
 include(GenerateExportHeader)
 include(${CMAKE_SOURCE_DIR}/cmake/helpers.cmake)
 
-set(CMAKE_INCLUDE_CURRENT_DIR ON)
+if(PROJECT_IS_TOP_LEVEL)
+    # Single-config generators leave this empty, which means no optimisation
+    # flags at all and a blank line in the summary below.
+    if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+        set(CMAKE_BUILD_TYPE "Debug" CACHE STRING "Build type" FORCE)
+        set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
+                     Debug Release RelWithDebInfo MinSizeRel)
+    endif()
 
-# For compiler options, we can also enable things like static analysis
-# later, as well as many other options. C++ is a large standard
-# so we will tweak only as necessary.
-if(WIN32)
-    # For DLL library definitions.
-    set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
+    # clangd needs this to resolve surrealdb headers while editing tests;
+    # without it the whole tree reads as errors while compiling fine.
+    if(NOT DEFINED CMAKE_EXPORT_COMPILE_COMMANDS)
+        set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+    endif()
 
-    add_compile_definitions(
-            # This sets the minimum feature set to Windows 7.
-            _WIN32_WINNT=0x0601
-    )
+    # IDE organisation, matching surrealdb.c's convention.
+    if(NOT DEFINED CMAKE_FOLDER)
+        set(CMAKE_FOLDER "surrealdb.cpp")
+    endif()
 endif()
 
-if(MSVC)
-    add_definitions(
-            # These are needed in windows to activate the __cplusplus macro
-            # which is off by default, and enforce macro reporting for version.
-            # Classically, these are off for backwards compatability.
-            " /Zc:__cplusplus "
-            #" /std:c++23 " # This actually doesn't exist in MSVC atm, needs exploring.
-    )
+if(PROJECT_IS_TOP_LEVEL AND NOT DEFINED CMAKE_INCLUDE_CURRENT_DIR)
+    set(CMAKE_INCLUDE_CURRENT_DIR ON)
 endif()
+
+# Platform defaults, again only when this is the project being built.
+#
+# `add_compile_definitions` and `add_definitions` are directory-scoped, so they
+# reach every target added below them -- including an embedding host's, if this
+# project was pulled in with add_subdirectory. Choosing a Windows API level for
+# someone else's build is not this library's business.
+if(PROJECT_IS_TOP_LEVEL AND WIN32)
+    if(NOT DEFINED CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS)
+        set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
+    endif()
+    add_compile_definitions(_WIN32_WINNT=0x0601)   # Windows 7 feature set
+endif()
+
+# Note on MSVC and /Zc:__cplusplus: without it MSVC reports __cplusplus as
+# 199711L regardless of /std. This library does not need the flag and does not
+# impose it -- config.hpp reads _MSVC_LANG, which is correct either way. The
+# previous `add_definitions(" /Zc:__cplusplus ")` was doubly wrong: a compiler
+# option passed as a definition, with surrounding whitespace, applied to every
+# target in the directory.
 
 # Platform agnostic installation trees.
 include(GNUInstallDirs)
@@ -115,7 +229,7 @@ include(GNUInstallDirs)
 # Dependencies
 # ============================================================================
 
-find_package(Surrealdb.c REQUIRED)
+find_package(surrealdb_c REQUIRED)
 
 # ============================================================================
 # Project structure.
@@ -124,15 +238,40 @@ find_package(Surrealdb.c REQUIRED)
 add_subdirectory_with_folder("surrealdb.cpp" src/surrealdb_cpp)
 
 # ============================================================================
-# Tests (Unity)
+# Tests
 # ============================================================================
+#
+# No framework. Every suite is a standalone binary returning non-zero on
+# failure, which is what makes it cheap to sweep them across every standard and
+# standard library with nothing but a compiler.
+#
+# Unity used to be pulled in here for a C test that no longer exists. It was a
+# required submodule even with BUILD_TESTING off, and its install rules put
+# `include/unity` and `lib/cmake/unity` into the consumer's prefix -- a test
+# framework leaking out of a header-only library. surrealdb.c vendors its own
+# Unity for its own C suite, so nothing here needs one.
+
+# Sanitizers for the test targets.
+#
+# surrealdb.c defines `SURREALDB_SANITIZE` and `surrealdb_apply_sanitizers()`;
+# reusing them means one flag covers both halves of the stack rather than each
+# growing its own spelling. Already defined when surrealdb.c was added as a
+# subproject, hence the guard.
+if(NOT COMMAND surrealdb_apply_sanitizers)
+    set(_sdb_sanitizers_module
+        "${CMAKE_CURRENT_LIST_DIR}/surrealdb.c/cmake/Sanitizers.cmake")
+    if(EXISTS "${_sdb_sanitizers_module}")
+        include("${_sdb_sanitizers_module}")
+    else()
+        # Fetch/system paths may not have the submodule on disk; keep the call
+        # sites uniform rather than making every one of them conditional.
+        function(surrealdb_apply_sanitizers target)
+        endfunction()
+    endif()
+endif()
 
 if(BUILD_TESTING)
     enable_testing()
-
-    set(UNITY_USE_SYSTEM OFF CACHE BOOL "Use a system-installed Unity if available" FORCE)
-    find_package(Unity REQUIRED MODULE)
-
     add_subdirectory(tests)
 endif()
 
@@ -147,4 +286,45 @@ if(BUILD_EXAMPLES)
     if(SURREALDB_USE_MODULES)
         add_subdirectory(examples/modules)
     endif()
+endif()
+
+# ============================================================================
+# Uninstall
+# ============================================================================
+#
+# CMake ships no uninstall target. surrealdb.c has one, but gates it on being
+# top-level -- so when this project is the top one, the whole tree had none.
+# Reuses the submodule's template for the same reason the other modules are
+# reused.
+
+if(PROJECT_IS_TOP_LEVEL AND NOT TARGET uninstall)
+    set(_sdb_uninstall_in
+        "${CMAKE_CURRENT_LIST_DIR}/surrealdb.c/cmake/cmake_uninstall.cmake.in")
+    if(EXISTS "${_sdb_uninstall_in}")
+        configure_file("${_sdb_uninstall_in}"
+                       "${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake"
+                       IMMEDIATE @ONLY)
+        add_custom_target(uninstall
+            COMMAND ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake"
+            COMMENT "Removing files listed in install_manifest.txt")
+    endif()
+endif()
+
+# ============================================================================
+# Summary
+# ============================================================================
+
+if(PROJECT_IS_TOP_LEVEL)
+    message(STATUS "")
+    message(STATUS "=== surrealdb.cpp ${PROJECT_VERSION} ===")
+    message(STATUS "Build type:   ${CMAKE_BUILD_TYPE}")
+    message(STATUS "C++ standard: ${CMAKE_CXX_STANDARD} (floor is 17)")
+    message(STATUS "Modules:      ${SURREALDB_USE_MODULES}")
+    message(STATUS "Testing:      ${BUILD_TESTING}")
+    message(STATUS "Examples:     ${BUILD_EXAMPLES}")
+    if(SURREALDB_SANITIZE)
+        message(STATUS "Sanitizers:   ${SURREALDB_SANITIZE}")
+    endif()
+    message(STATUS "surrealdb.c:  ${SURREALDB_C_ORIGIN}")
+    message(STATUS "")
 endif()

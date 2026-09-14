@@ -1,0 +1,11 @@
+# The Rust staticlib is not instrumented and holds allocations alive until the
+# process exits -- the tokio runtime, the datastore, lazily-built statics. None
+# of that is a leak this suite can act on, and reporting it would bury the
+# frames that matter.
+#
+# Anything allocated on the C++ side still reports: these match by the name of
+# the frame that allocated, not by where the pointer ended up.
+leak:surrealdb
+leak:tokio
+leak:std::rt
+leak:rust_
