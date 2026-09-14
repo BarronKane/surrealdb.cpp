@@ -238,6 +238,24 @@ find_package(surrealdb_c REQUIRED)
 add_subdirectory_with_folder("surrealdb.cpp" src/surrealdb_cpp)
 
 # ============================================================================
+# Licence files
+# ============================================================================
+#
+# Apache-2.0 section 4 requires the NOTICE to travel with any redistribution,
+# so an installed prefix has to carry it rather than leaving it in the repo.
+# Only when top-level: a superproject installing us as a subdirectory has its
+# own docdir and its own notices to assemble, and NOTICE names surrealdb.cpp
+# specifically -- dropping it into someone else's share/doc would misattribute
+# the tree it landed in.
+if(PROJECT_IS_TOP_LEVEL)
+    install(FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
+        "${CMAKE_CURRENT_SOURCE_DIR}/NOTICE"
+        DESTINATION "${CMAKE_INSTALL_DOCDIR}"
+    )
+endif()
+
+# ============================================================================
 # Tests
 # ============================================================================
 #

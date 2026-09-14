@@ -1,0 +1,32 @@
+surrealdb.cpp
+Copyright 2026 Lance Wallis
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This is an unofficial, community-maintained project. It is not affiliated
+with, endorsed by, or supported by SurrealDB Ltd.
+
+-------------------------------------------------------------------------------
+Third-party components
+-------------------------------------------------------------------------------
+
+surrealdb.c -- the official SurrealDB SDK for C
+    https://github.com/surrealdb/surrealdb.c
+    Copyright (c) SurrealDB Ltd
+    Licensed under the Apache License, Version 2.0.
+
+    Included here as a git submodule. Its own LICENSE travels with it.
+
+SurrealDB (Rust crates `surrealdb` and `surrealdb-core`, 3.2.4)
+    https://github.com/surrealdb/surrealdb
+    Copyright (c) 2025 SurrealDB Ltd
+    Licensed under the Business Source License 1.1.
+    Change Date: 2030-01-01.  Change License: Apache License, Version 2.0.
+
+    surrealdb.c links these crates statically, so a binary built against
+    surrealdb.cpp contains BSL-1.1 code. The Apache-2.0 grant in LICENSE
+    covers the C++ wrapper in this repository and nothing beyond it;
+    redistributing a linked binary is additionally subject to the BSL terms.
+    The Additional Use Grant permits use except as a "Database Service" --
+    read it rather than relying on this summary:
+    https://surrealdb.com/legal

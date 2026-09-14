@@ -7,8 +7,13 @@ A C++ wrapper for SurrealDB, built on the official C SDK.
 > [surrealdb.c](https://github.com/surrealdb/surrealdb.c) — *is* official; this
 > one is not. Pre-1.0 and under active development: expect the API to move.
 
-Header-only, C++17 or later, no dependencies beyond the C SDK and the standard
-library.
+C++17 or later, no dependencies beyond the C SDK and the standard library.
+
+The C++ layer compiles to nothing: it is headers, and an INTERFACE target, so
+there is no build of its own, no ABI to match and no standard or exception mode
+baked in ahead of you. That is not the same as drop-in — linking still pulls in
+surrealdb.c, a Rust staticlib with the whole database engine inside it. See
+[Building](#building).
 
 ## Getting started
 
@@ -448,7 +453,13 @@ must not happen.
 
 ## Building
 
-Nothing to compile: add the include directory and the C library.
+Nothing in *this* repository compiles. What compiles is surrealdb.c, and it is
+not small: a `cargo build` of SurrealDB itself, minutes and gigabytes on a cold
+cache — the debug staticlib alone is over a gigabyte, because a Rust `.a` keeps
+every dependency. Everything after the first build is cached.
+
+One exception to "nothing compiles" — `SURREALDB_USE_MODULES=ON` builds the
+C++20 module interface into a static library. The header path stays headers.
 
 ```sh
 cmake -S . -B build && cmake --build build
@@ -531,11 +542,11 @@ installed prefix, not just this build tree.
 
 ## Standards
 
-**C++17 is a floor, not a target, and there is no ceiling.** The library is
-header-only, so it compiles with whatever flags you already use — it has no
-build of its own to impose a standard on you. Set C++17, or 23, or whatever
-your toolchain calls the current draft; it works, and newer features are used
-where they exist.
+**C++17 is a floor, not a target, and there is no ceiling.** The C++ layer is
+headers only, so it compiles with whatever flags you already use — there is no
+prebuilt object to match a standard, an ABI or an exception mode against. Set
+C++17, or 23, or whatever your toolchain calls the current draft; it works, and
+newer features are used where they exist.
 
 Everything the library does is available at C++17. Newer standards **add**,
 never substitute:
@@ -600,6 +611,9 @@ rather than through a generator.
   [Standards](#standards).
 - [surrealdb.c](https://github.com/surrealdb/surrealdb.c) — found automatically,
   or cloned if missing.
+- A **Rust toolchain** (`cargo`), unless surrealdb.c is already installed. The C
+  SDK is a Rust staticlib and is built from source; `find_package(surrealdb_c)`
+  finding an installed one is what lets you skip this.
 
 Tested on **Linux** across every configuration listed under
 [Standards](#standards), with both libstdc++ and libc++. **macOS and Windows are
@@ -607,4 +621,23 @@ untested** — nothing is known to be wrong on either, but nobody has run it.
 
 ## Licence
 
-See [LICENSE](LICENSE).
+**surrealdb.cpp is [Apache-2.0](LICENSE)** — the same licence as surrealdb.c,
+which it wraps. Matching it means there is no compatibility question between
+the two halves, and the patent grant reads the same on both sides of the
+boundary.
+
+That covers the wrapper in this repository. It does **not** cover what you link
+against. surrealdb.c statically links the `surrealdb` and `surrealdb-core`
+crates, and those are **Business Source License 1.1** — source-available rather
+than open source, converting to Apache-2.0 on 2030-01-01. A binary built
+against this library therefore contains BSL code, and shipping it is subject to
+those terms as well as these.
+
+The BSL's Additional Use Grant permits everything except offering the licensed
+work as a *Database Service* to third parties. Embedding the engine in an
+application — the case this library exists for — sits squarely inside the
+grant; selling database-as-a-service built on it does not.
+
+That is a summary written by a programmer, not advice from a lawyer.
+[NOTICE](NOTICE) carries the attributions; read the BSL itself and
+[surrealdb.com/legal](https://surrealdb.com/legal) before relying on any of it.
