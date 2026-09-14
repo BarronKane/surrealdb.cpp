@@ -22,6 +22,7 @@ import surrealdb;
 #  include "geometry.hpp"
 #  include "make.hpp"
 #  include "options.hpp"
+#  include "poll.hpp"
 #  include "rpc.hpp"
 #  include "results.hpp"
 #  include "stream.hpp"

@@ -39,6 +39,11 @@ enum class error_code : int {
     closed = SR_CLOSED,  // -1
     error  = SR_ERROR,   // -2
     fatal  = SR_FATAL,   // -3
+    /// A bounded wait expired. Mirrored here so the enum stays a complete map
+    /// of the C status codes, but it is **not a failure** and never reaches an
+    /// `error`: the `_timeout` readers translate it into `poll_state::timed_out`
+    /// before it can be mistaken for one. See poll.hpp.
+    timeout = SR_TIMEOUT, // -4
 };
 
 [[nodiscard]] constexpr bool is_ok(error_code c) noexcept {
@@ -52,6 +57,7 @@ enum class error_code : int {
         case error_code::closed: return "closed";
         case error_code::error:  return "error";
         case error_code::fatal:  return "fatal";
+        case error_code::timeout: return "timeout";
     }
     return "unknown";
 }

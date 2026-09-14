@@ -16,7 +16,7 @@ if(APPLE AND EXISTS "${_sdb_apple_module}")
     include("${_sdb_apple_module}")
 endif()
 
-project(surrealdb_cpp VERSION 0.1.0 LANGUAGES C CXX)
+project(surrealdb_cpp VERSION 0.1.1 LANGUAGES C CXX)
 
 # ============================================================================
 # Git Submodules
@@ -230,6 +230,52 @@ include(GNUInstallDirs)
 # ============================================================================
 
 find_package(surrealdb_c REQUIRED)
+
+# --- minimum surrealdb.c -----------------------------------------------------
+#
+# 0.1.1 calls `sr_stream_next_timeout`, which arrived in surrealdb.c 0.2.6.
+# `detail/c_api.hpp` static_asserts this and is the real backstop -- it fires
+# wherever the headers come from, including an installed package this module
+# never looked inside. Checking here as well only buys an earlier and more
+# obvious failure: a configure error naming both versions beats a compile error
+# in a header the user did not write.
+#
+# The floor is read out of c_api.hpp rather than written twice, for the same
+# reason the project version is read out of config.hpp.
+file(READ "${PROJECT_SOURCE_DIR}/src/surrealdb_cpp/include/surrealdb/detail/c_api.hpp" _sdb_capi)
+string(REGEX MATCH "SURREALDB_CPP_REQUIRES_C_MAJOR ([0-9]+)" _ "${_sdb_capi}")
+set(_sdb_need "${CMAKE_MATCH_1}")
+string(REGEX MATCH "SURREALDB_CPP_REQUIRES_C_MINOR ([0-9]+)" _ "${_sdb_capi}")
+string(APPEND _sdb_need ".${CMAKE_MATCH_1}")
+string(REGEX MATCH "SURREALDB_CPP_REQUIRES_C_PATCH ([0-9]+)" _ "${_sdb_capi}")
+string(APPEND _sdb_need ".${CMAKE_MATCH_1}")
+unset(_sdb_capi)
+
+# Best effort: the header is not always locatable from here (an installed
+# package carries its own include path through the target, which is not
+# readable at configure time without resolving generator expressions). When it
+# cannot be found the static_assert still covers it, so this reports and moves
+# on rather than failing.
+find_file(SURREALDB_C_HEADER surrealdb.h
+    HINTS "${SURREALDB_C_INCLUDE_DIR}" "${SURREALDB_C_SOURCE_DIR}/include"
+    NO_DEFAULT_PATH)
+if(SURREALDB_C_HEADER)
+    file(READ "${SURREALDB_C_HEADER}" _sdb_h)
+    string(REGEX MATCH "SR_VERSION_STRING \"([0-9.]+)\"" _ "${_sdb_h}")
+    set(SURREALDB_C_VERSION "${CMAKE_MATCH_1}")
+    unset(_sdb_h)
+    if(SURREALDB_C_VERSION VERSION_LESS _sdb_need)
+        message(FATAL_ERROR
+            "surrealdb.cpp ${PROJECT_VERSION} needs surrealdb.c ${_sdb_need} or "
+            "newer; found ${SURREALDB_C_VERSION} at ${SURREALDB_C_HEADER}. "
+            "Run: git submodule update --init --recursive")
+    endif()
+    message(STATUS "surrealdb.c ${SURREALDB_C_VERSION} (need >= ${_sdb_need})")
+else()
+    message(STATUS "surrealdb.c version not readable here; "
+                   "detail/c_api.hpp asserts the >= ${_sdb_need} floor at compile time")
+endif()
+mark_as_advanced(SURREALDB_C_HEADER)
 
 # ============================================================================
 # Project structure.

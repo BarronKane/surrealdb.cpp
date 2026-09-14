@@ -6,11 +6,22 @@
 /// Three properties of the C stream API shape everything here, and all three
 /// are easy to get wrong:
 ///
-/// **It blocks, with no timeout and no cancellation.** `sr_stream_next` parks
-/// until an event arrives. There is no way to release a parked reader from
-/// another thread -- `sr_stream_kill` frees the very stream that reader is
-/// borrowing. So this is driven from a dedicated worker thread, and only when
-/// an event is expected -- never from a thread that has to stay responsive.
+/// **`next()` blocks with no cancellation.** `sr_stream_next` parks until an
+/// event arrives, and there is no way to release a parked reader from another
+/// thread -- `sr_stream_kill` frees the very stream that reader is borrowing.
+/// So `next()` belongs on a dedicated worker thread, and only when an event is
+/// expected.
+///
+/// **`next_for()` and `try_next()` are the way out of that.** surrealdb.c 0.2.6
+/// added `sr_stream_next_timeout`, so a reader can now wait with a bound and
+/// come back to check a shutdown flag. That is the call for any thread that has
+/// to stay responsive, and it is the only way to stop a reader cooperatively:
+/// a thread parked in `next()` still cannot be released by anything short of
+/// ending the process.
+///
+/// A bounded wait has three outcomes rather than two -- value, timeout, end --
+/// so these return `result<poll<notification>>`; see poll.hpp for why the last
+/// two must not be merged.
 ///
 /// **Teardown is ordered.** A stream borrows the runtime owned by its
 /// connection, so the stream must be killed *before* the connection is
@@ -33,8 +44,10 @@
 #include "detail/invoke.hpp"
 #include "detail/owned.hpp"
 #include "error.hpp"
+#include "poll.hpp"
 #include "value.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <iterator>
 #include <memory>
@@ -132,6 +145,9 @@ public:
     ///
     /// `nullopt` means the stream ended cleanly. An error result means it
     /// failed; either way the stream is finished afterwards.
+    ///
+    /// An unbounded wait cannot time out, so two states suffice here and the
+    /// `optional` stays. `next_for()` is the one that needs a third.
     [[nodiscard]] result<std::optional<notification>> next() noexcept {
         if (done_ || !handle_) return std::optional<notification>{};
 
@@ -148,6 +164,49 @@ public:
         failed_ = true;
         failure_ = error(static_cast<error_code>(rc), owned_string());
         return error(static_cast<error_code>(rc), owned_string());
+    }
+
+    /// Wait for the next notification, giving up after `timeout`.
+    ///
+    /// Four outcomes, and a reader that loops has to handle all four:
+    ///
+    ///     for (;;) {
+    ///         auto r = s.next_for(std::chrono::milliseconds(100));
+    ///         if (!r) { report(r.error()); break; }   // stream failed
+    ///
+    ///         auto& p = r.value();
+    ///         if (p.ended()) break;                   // stream finished
+    ///         if (p.timed_out()) {                    // nothing yet
+    ///             if (shutting_down) break;
+    ///             continue;
+    ///         }
+    ///         handle(*p.take());
+    ///     }
+    ///
+    /// **A timeout does not consume anything.** Notifications queue in a
+    /// channel and an expired wait leaves any later arrival in place, so
+    /// polling in a loop cannot lose an event.
+    ///
+    /// A timeout also leaves the stream open: unlike `next()`, returning here
+    /// is not the end of anything, and `done()` stays false. Only an end or a
+    /// failure finishes the stream.
+    ///
+    /// Durations are rounded up to whole milliseconds and clamped to about 24
+    /// days; negative durations poll once rather than blocking forever. See
+    /// `detail::to_timeout_ms`.
+    template <class Rep, class Period>
+    [[nodiscard]] result<poll<notification>> next_for(
+            std::chrono::duration<Rep, Period> timeout) noexcept {
+        return next_timeout_ms(detail::to_timeout_ms(timeout));
+    }
+
+    /// Take a notification if one is already waiting, otherwise report a
+    /// timeout immediately. Never blocks.
+    ///
+    /// This is `next_for(0ms)`, spelled out because a non-blocking poll is a
+    /// different intent from a short wait and reads badly as a magic zero.
+    [[nodiscard]] result<poll<notification>> try_next() noexcept {
+        return next_timeout_ms(0);
     }
 
     /// Close the stream early. Safe to call more than once.
@@ -225,6 +284,34 @@ public:
     [[nodiscard]] iterator end() noexcept { return iterator(); }
 
 private:
+    /// The shared body of `next_for` and `try_next`.
+    ///
+    /// Not public: `int` milliseconds is the C's spelling, where a negative
+    /// value silently means "forever". Exposing that would put the one
+    /// conversion mistake this library guards against back in the caller's
+    /// hands, and `next()` already says "forever" without a sentinel.
+    [[nodiscard]] result<poll<notification>> next_timeout_ms(int ms) noexcept {
+        if (done_ || !handle_) return poll<notification>(poll_state::ended);
+
+        sr_notification_t raw{};
+        const int rc = ::sr_stream_next_timeout(handle_.get(), &raw, ms);
+
+        if (rc > 0) return poll<notification>(notification(raw));
+
+        // The one branch that must not fall through to the shared "finished"
+        // handling below: the stream is still live and the caller should come
+        // back. Marking it done here would abandon a stream over nothing more
+        // than a quiet hundred milliseconds.
+        if (rc == SR_TIMEOUT) return poll<notification>(poll_state::timed_out);
+
+        done_ = true;
+        if (rc == SR_NONE) return poll<notification>(poll_state::ended);
+
+        failed_ = true;
+        failure_ = error(static_cast<error_code>(rc), owned_string());
+        return error(static_cast<error_code>(rc), owned_string());
+    }
+
     friend class connection;
     stream(sr_stream_t* raw, std::weak_ptr<const void> alive) noexcept
         : handle_(raw), alive_(std::move(alive)) {}

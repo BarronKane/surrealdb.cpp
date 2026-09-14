@@ -10,6 +10,7 @@
 // it. The same bug class turned up again in `array_builder::push`. A snippet
 // nobody compiles is a snippet that is wrong.
 #include <surrealdb/surrealdb.hpp>
+#include <chrono>
 #include <vector>
 #include <string>
 using namespace surrealdb;
@@ -158,6 +159,32 @@ int main() {
         fields.set("email", "ada@example.com").set("pass", "s3cret").set("nickname", "countess");
         access acc{"ns", "db", "account"};
         (void)db.signup(acc, fields);
+    }
+
+    // -- Bounded waits --
+    //
+    // Transcribed as the README has it. Compiled, never run, like the rest of
+    // this file -- the loop is unbounded on purpose there.
+    {
+        auto live = db.live("person");
+        if (live) {
+            stream stream_ = std::move(live).value();
+            bool shutting_down = false;
+            for (;;) {
+                auto r = stream_.next_for(std::chrono::milliseconds(100));
+                if (!r) break;                          // the stream failed
+
+                auto& p = r.value();
+                if (p.ended()) break;                   // the stream finished
+                if (p.timed_out()) {                    // nothing yet
+                    if (shutting_down) break;
+                    continue;
+                }
+                auto n = p.take();
+                handle(n->action(), n->data());
+            }
+            (void)stream_.try_next();
+        }
     }
 
     // -- RPC and sessions --

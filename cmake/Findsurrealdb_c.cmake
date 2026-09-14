@@ -48,8 +48,18 @@ set(SURREALDB_C_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/../surrealdb.c"
     CACHE PATH "Path to the surrealdb.c source checkout")
 set(SURREALDB_C_GIT_REPOSITORY "https://github.com/BarronKane/surrealdb.c.git"
     CACHE STRING "Repository to clone surrealdb.c from")
-set(SURREALDB_C_GIT_TAG "main-standardization"
-    CACHE STRING "Ref of surrealdb.c to clone")
+# A tag, not a branch.
+#
+# This used to default to `main-standardization`, which meant a non-recursive
+# clone of surrealdb.cpp fetched whatever that branch happened to point at --
+# so two people building the same surrealdb.cpp commit could get different C
+# libraries, and neither would match the submodule pointer this repository
+# actually pins. A tag makes the fetch path reproduce the submodule path.
+#
+# Bump this and the submodule together; the floor check below catches the case
+# where they disagree in the direction that matters.
+set(SURREALDB_C_GIT_TAG "v0.2.6"
+    CACHE STRING "Ref of surrealdb.c to clone. Prefer a tag over a branch.")
 
 set(SURREALDB_C_ORIGIN "")
 

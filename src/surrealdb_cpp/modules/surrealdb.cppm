@@ -39,6 +39,10 @@ using ::surrealdb::ok;
 using ::surrealdb::result;
 using ::surrealdb::to_string;
 
+// Bounded waits
+using ::surrealdb::poll;
+using ::surrealdb::poll_state;
+
 // Ownership
 using ::surrealdb::owned_array;
 using ::surrealdb::owned_arr_results;

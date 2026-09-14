@@ -30,8 +30,10 @@
 #include "detail/owned.hpp"
 #include "error.hpp"
 #include "options.hpp"
+#include "poll.hpp"
 #include "value.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
@@ -184,8 +186,9 @@ private:
 /// `id`, `action` and `result`.
 ///
 /// Shaped like `stream` deliberately -- same blocking contract, same iteration
-/// caveat -- but it yields encoded bytes rather than a typed notification,
-/// because that is what the RPC path produces.
+/// caveat, same `next_for`/`try_next` escape from it -- but it yields encoded
+/// bytes rather than a typed notification, because that is what the RPC path
+/// produces.
 class rpc_stream {
 public:
     rpc_stream() noexcept = default;
@@ -210,8 +213,9 @@ public:
     /// Block until the next notification.
     ///
     /// An empty (but successful) result means the stream closed cleanly, which
-    /// is what disconnecting the context produces. There is no timeout and no
-    /// cancellation: the only way to release a parked reader is to disconnect.
+    /// is what disconnecting the context produces. There is no cancellation:
+    /// the only way to release a reader parked *here* is to disconnect. Use
+    /// `next_for()` for a reader that has to be able to give up.
     [[nodiscard]] result<owned_byte_array> next() noexcept {
         if (done_ || !handle_) return owned_byte_array();
 
@@ -226,6 +230,29 @@ public:
         if (rc == SR_CLOSED || rc == SR_NONE) return owned_byte_array();
 
         return error(static_cast<error_code>(rc), owned_string());
+    }
+
+    /// Wait for the next notification, giving up after `timeout`.
+    ///
+    /// The `rpc_stream` counterpart of `stream::next_for`, with the same four
+    /// outcomes and the same rule that a timeout consumes nothing.
+    ///
+    /// One difference worth knowing, inherited from the C: this wait does not
+    /// touch a tokio runtime, deliberately, because an `rpc_stream` outlives
+    /// the context it came from and must not hold a handle to a runtime that
+    /// may already be shut down. The wait is a poll at millisecond granularity
+    /// rather than a timer, so a very short timeout is a busy-ish wait rather
+    /// than a cheap one. Prefer tens of milliseconds over one.
+    template <class Rep, class Period>
+    [[nodiscard]] result<poll<owned_byte_array>> next_for(
+            std::chrono::duration<Rep, Period> timeout) noexcept {
+        return next_timeout_ms(detail::to_timeout_ms(timeout));
+    }
+
+    /// Take a payload if one is already waiting, otherwise report a timeout
+    /// immediately. Never blocks.
+    [[nodiscard]] result<poll<owned_byte_array>> try_next() noexcept {
+        return next_timeout_ms(0);
     }
 
     /// Close early. Safe to call more than once.
@@ -283,6 +310,29 @@ public:
     [[nodiscard]] iterator end() noexcept { return iterator(); }
 
 private:
+    /// The shared body of `next_for` and `try_next`. Private for the same
+    /// reason as `stream`'s: a raw `int` where negative silently means forever
+    /// is the mistake `to_timeout_ms` exists to prevent.
+    [[nodiscard]] result<poll<owned_byte_array>> next_timeout_ms(int ms) noexcept {
+        if (done_ || !handle_) return poll<owned_byte_array>(poll_state::ended);
+
+        std::uint8_t* out = nullptr;
+        const int rc = ::sr_rpc_stream_next_timeout(handle_.get(), &out, ms);
+
+        if (rc > 0) return poll<owned_byte_array>(owned_byte_array(out, rc));
+
+        // Still live -- come back. Must not reach the `done_` below.
+        if (rc == SR_TIMEOUT) return poll<owned_byte_array>(poll_state::timed_out);
+
+        done_ = true;
+        // SR_CLOSED is the ordinary end here, as in `next()`: it is what
+        // shutting the context down on purpose produces.
+        if (rc == SR_CLOSED || rc == SR_NONE)
+            return poll<owned_byte_array>(poll_state::ended);
+
+        return error(static_cast<error_code>(rc), owned_string());
+    }
+
     friend class rpc;
     rpc_stream(sr_RpcStream* raw, std::weak_ptr<const void> alive) noexcept
         : handle_(raw), alive_(std::move(alive)) {}
@@ -402,7 +452,17 @@ public:
         return wanted;   // filled in place when it went in zeroed
     }
 
-    /// Close a session, cancelling the live queries and transactions it owns.
+    /// Close a session, cancelling the live queries it owns.
+    ///
+    /// **Each cancelled live query emits one final notification** on the
+    /// notification stream, with `action::killed` and no result. That is the
+    /// signal a live query is over; nothing further arrives for it. A reader
+    /// that ignores `killed` will sit waiting for events that can no longer
+    /// come.
+    ///
+    /// The durable copy of the session is removed first, so a detached session
+    /// cannot be rehydrated from `session_dir`. There are no client-managed
+    /// transactions on this transport, so there are none to cancel.
     [[nodiscard]] result<void> detach(const session_id& session) noexcept {
         return track(detail::invoke([&](sr_string_t* e) {
             return ::sr_rpc_session_detach(raw(), e, session.raw());
@@ -411,6 +471,18 @@ public:
 
     /// Return a session to its initial state without closing it -- the cheap
     /// way to recycle one between clients, since the id stays valid.
+    ///
+    /// **This cancels the session's live queries too**, each emitting a final
+    /// `action::killed` notification exactly as `detach` does. A reset drops
+    /// the identity those queries were registered under, so they must not keep
+    /// delivering to whoever holds the session next.
+    ///
+    /// The same applies to the authentication methods reached through
+    /// `execute_on` -- `signin`, `signup`, `authenticate`, `refresh` and
+    /// `invalidate` all retire the session's live queries, because the caller
+    /// they were authorised for no longer exists. Recycling a session for a new
+    /// client is therefore safe by construction, but a client that re-signs-in
+    /// mid-stream has to re-register its live queries.
     [[nodiscard]] result<void> reset(const session_id& session) noexcept {
         return track(detail::invoke([&](sr_string_t* e) {
             return ::sr_rpc_session_reset(raw(), e, session.raw());

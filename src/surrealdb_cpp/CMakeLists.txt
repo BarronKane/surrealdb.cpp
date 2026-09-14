@@ -63,6 +63,7 @@ set(SDB_PUBLIC_HEADERS
     include/surrealdb/geometry.hpp
     include/surrealdb/make.hpp
     include/surrealdb/options.hpp
+    include/surrealdb/poll.hpp
     include/surrealdb/results.hpp
     include/surrealdb/rpc.hpp
     include/surrealdb/stream.hpp

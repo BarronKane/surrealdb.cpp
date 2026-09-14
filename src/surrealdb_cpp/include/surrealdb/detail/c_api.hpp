@@ -48,3 +48,32 @@ extern "C" {
 #elif defined(_MSC_VER)
 #  pragma warning(pop)
 #endif
+
+// ---------------------------------------------------------------------------
+// Minimum surrealdb.c
+// ---------------------------------------------------------------------------
+//
+// This library calls functions that do not exist in every release -- 0.1.1
+// needs `sr_stream_next_timeout` and `sr_rpc_stream_next_timeout`, added in
+// surrealdb.c 0.2.6 -- and building against an older header does not fail
+// anywhere useful. It fails as an undeclared identifier partway down
+// stream.hpp, or, if the declaration happens to exist but the symbol does not,
+// at the link with a mangled name and no hint about which half is stale.
+//
+// One assertion at the point the C API enters turns that into a sentence. The
+// floor is checked, not the exact version: surrealdb.c is additive within a
+// minor, so newer is fine and only older is a problem.
+#define SURREALDB_CPP_REQUIRES_C_MAJOR 0
+#define SURREALDB_CPP_REQUIRES_C_MINOR 2
+#define SURREALDB_CPP_REQUIRES_C_PATCH 6
+
+#if !defined(SR_VERSION)
+#  error "surrealdb.h defines no SR_VERSION. surrealdb.cpp needs surrealdb.c v0.2.6 or newer."
+#endif
+
+static_assert(SR_VERSION >= SR_VERSION_ENCODE(SURREALDB_CPP_REQUIRES_C_MAJOR,
+                                              SURREALDB_CPP_REQUIRES_C_MINOR,
+                                              SURREALDB_CPP_REQUIRES_C_PATCH),
+              "surrealdb.cpp requires surrealdb.c v0.2.6 or newer "
+              "(SR_VERSION_STRING reports what was actually found). Update the "
+              "surrealdb.c submodule, or point SURREALDB_C_ROOT at a newer one.");

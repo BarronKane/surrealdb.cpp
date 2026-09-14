@@ -1,8 +1,12 @@
 // P3 live-query tests: notifications, iteration, teardown ordering.
 //
-// sr_stream_next blocks with no timeout and no cancellation, so every call
-// here is made only after an event has been produced. A test that blocks
-// forever is worse than one that fails.
+// sr_stream_next blocks with no cancellation, so every call here is made only
+// after an event has been produced. A test that blocks forever is worse than
+// one that fails.
+//
+// The bounded readers that *can* give up -- next_for, try_next -- live in
+// p13_timeout.cpp. This file stays on the unbounded call deliberately: it is
+// still the primitive, and it still has to behave.
 
 #include <surrealdb/surrealdb.hpp>
 

@@ -12,6 +12,7 @@
 import surrealdb;
 
 #include <cstdint>
+#include <chrono>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -218,7 +219,18 @@ void probe_connection() {
     // Opened and closed without ever reading: next() would block.
     auto live = db.live("probe_tbl");
     expect(live.has_value(), "live");
-    if (live) { sdb::stream s = std::move(live).value(); s.close(); }
+    if (live) {
+        sdb::stream s = std::move(live).value();
+        // Bounded waits, through whichever spelling this probe is testing.
+        // `try_next` cannot block, so it is safe here where a blocking read
+        // would hang a probe that has produced no events.
+        auto p = s.try_next();
+        expect(p.has_value(), "stream try_next");
+        if (p) expect(p.value().timed_out() || p.value().ended(), "stream poll state");
+        auto q = s.next_for(std::chrono::milliseconds(1));
+        expect(q.has_value(), "stream next_for");
+        s.close();
+    }
 
     auto tx = db.begin();
     expect(tx.has_value(), "begin");
@@ -257,7 +269,39 @@ void probe_rpc() {
     // Opened and closed without reading, for the same reason as `live`.
     auto ns = ctx.notifications();
     expect(ns.has_value(), "notifications");
-    if (ns) { sdb::rpc_stream st = std::move(ns).value(); st.close(); }
+    if (ns) {
+        sdb::rpc_stream st = std::move(ns).value();
+        auto p = st.try_next();
+        expect(p.has_value(), "rpc_stream try_next");
+        if (p) expect(p.value().timed_out() || p.value().ended(), "rpc_stream poll state");
+        auto q = st.next_for(std::chrono::milliseconds(1));
+        expect(q.has_value(), "rpc_stream next_for");
+        st.close();
+    }
+}
+
+
+// poll<T> and the duration clamp, independent of any connection.
+//
+// Cheap, and the part of the new surface that must exist identically at every
+// standard and through both spellings -- a module consumer gets these as
+// exported names, not macros.
+void probe_poll() {
+    sdb::poll<int> ready(5);
+    expect(ready.ready() && ready.value() == 5, "poll ready");
+
+    sdb::poll<int> t(sdb::poll_state::timed_out);
+    expect(t.timed_out() && !t.ended(), "poll timed_out");
+
+    sdb::poll<int> d;
+    expect(d.ended(), "poll default is ended");
+
+    auto taken = ready.take();
+    expect(taken.has_value() && *taken == 5 && ready.ended(), "poll take");
+
+    expect(std::string(sdb::to_string(sdb::poll_state::timed_out)) == "timed_out",
+           "poll_state to_string");
+    expect(sdb::to_string(sdb::error_code::timeout) != nullptr, "error_code timeout");
 }
 
 } // namespace
@@ -269,6 +313,7 @@ int main() {
                 static_cast<int>(sdb::has_span),
                 static_cast<int>(sdb::has_std_expected));
 
+    probe_poll();
     probe_values();
     probe_dsl();
     probe_connection();

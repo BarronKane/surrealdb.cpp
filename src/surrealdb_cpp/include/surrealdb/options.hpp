@@ -106,6 +106,21 @@ public:
         return *this;
     }
     /// Directory in which RPC sessions are persisted. Empty disables it.
+    ///
+    /// **These files hold credentials.** A session is serialised whole, and a
+    /// session carries its authentication token, its record-authentication data
+    /// and its variables -- written as plain JSON, neither encrypted nor
+    /// obfuscated. Anything that can read the file can replay the session.
+    ///
+    /// surrealdb.c restricts the directory and its files to the current user
+    /// (0700/0600 on unix; elsewhere the inherited ACL is all there is), which
+    /// is sufficient on a server -- the case upstream built this for. It is not
+    /// disk encryption. Keep the directory off shared or synced volumes, and
+    /// think hard before enabling it at all on hardware the end user controls,
+    /// where "the current user" and "the attacker" are the same account.
+    ///
+    /// Left empty, nothing is written and sessions live only as long as the
+    /// context. That is the right default for a client.
     options& session_dir(std::string dir) {
         session_dir_ = std::move(dir);
         return *this;

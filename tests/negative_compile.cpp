@@ -38,6 +38,19 @@ int main() {
     // all_ok() borrows nothing, so it stays legal on a temporary.
     (void)db.query("RETURN 1", nullptr).value().all_ok();
 
+    // The sanctioned bounded-wait spellings. take() moves ownership out, so it
+    // is legal on a named poll and leaves nothing behind to dangle.
+    auto live = db.live("t");
+    if (live) {
+        sdb::stream s = std::move(live).value();
+        auto polled = s.try_next();
+        if (polled) {
+            auto& p = polled.value();
+            if (p.ready()) { auto n = p.take(); (void)n; }
+        }
+        s.close();
+    }
+
 #elif SURREALDB_NEG_CASE == 1
     // single() on a temporary: the view outlives the results that own it.
     auto rows = db.query("RETURN 1", nullptr).value().single();
@@ -73,6 +86,29 @@ int main() {
     // first_error() on a temporary.
     auto bad = db.query("RETURN 1", nullptr).value().first_error();
     (void)bad;
+
+#elif SURREALDB_NEG_CASE == 7
+    // value() on a poll temporary. `owned_byte_array` is a range, so
+    //
+    //     for (auto b : *rs.try_next().value())
+    //
+    // would iterate bytes owned by a poll that died at the semicolon. This is
+    // the shape that produced a heap-use-after-free in query().single().
+    auto live = db.live("t");
+    if (live) {
+        sdb::stream s = std::move(live).value();
+        auto&& n = s.try_next().value().value();
+        (void)n;
+    }
+
+#elif SURREALDB_NEG_CASE == 8
+    // operator* on a poll temporary: the same borrow by a shorter spelling.
+    auto live2 = db.live("t");
+    if (live2) {
+        sdb::stream s = std::move(live2).value();
+        auto&& n = *s.try_next().value();
+        (void)n;
+    }
 
 #endif
     return 0;

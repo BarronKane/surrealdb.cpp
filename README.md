@@ -193,18 +193,56 @@ while (auto n = stream.next()) {
 
 Three things about this API are worth knowing before you use it:
 
-- **It blocks.** There is no timeout and no non-blocking variant. Drive it from
-  a dedicated thread, not a latency-sensitive one.
-- **There is no cancellation.** A reader parked in `next()` cannot be released
-  from another thread, because killing the stream frees the very thing that
-  reader is using. Call it only when an event is expected.
+- **`next()` blocks, and cannot be cancelled.** A reader parked in it cannot be
+  released from another thread, because killing the stream frees the very thing
+  that reader is using. Call it only when an event is expected, from a dedicated
+  thread. `next_for()` below is the way out of that.
 - **Teardown is ordered.** A stream borrows its connection's runtime, so it must
   be destroyed first. Natural scoping already does this; a stream moved
   somewhere longer-lived does not, and the library detects that rather than
   running a kill against a dead runtime.
+- **A range-for blocks *past* the last event you know about** — the loop
+  increments before re-testing its condition. Break from inside the body.
 
-A range-for works, but note it blocks *past* the last event you know about — the
-loop increments before re-testing its condition. Break from inside the body.
+### Bounded waits
+
+A reader that has to stay responsive — to a shutdown flag, usually — waits with
+a bound instead. This needs **surrealdb.c 0.2.6 or newer**.
+
+```cpp
+for (;;) {
+    auto r = stream.next_for(std::chrono::milliseconds(100));
+    if (!r) break;                          // the stream failed
+
+    auto& p = r.value();
+    if (p.ended()) break;                   // the stream finished
+    if (p.timed_out()) {                    // nothing yet
+        if (shutting_down) break;
+        continue;
+    }
+    auto n = p.take();
+    handle(n->action(), n->data());
+}
+```
+
+`try_next()` is the same thing with a zero timeout: take an event if one is
+already there, otherwise say so immediately.
+
+**A timeout is not the end of the stream, and the two must not be merged.** Read
+a timeout as an end and you abandon a live query over a quiet hundred
+milliseconds; read an end as a timeout and you spin forever on a stream that is
+finished. That is why these return `poll<T>` rather than an `optional` that
+cannot tell you which happened — four states, all of which a looping reader has
+to answer for.
+
+An expired wait consumes nothing. Notifications queue in a channel and a poll
+that finds it empty leaves any later arrival in place, so polling in a loop
+cannot lose an event.
+
+`rpc_stream` has the same pair. One difference, inherited from the C: its wait
+is a poll at millisecond granularity rather than a timer, because an
+`rpc_stream` outlives the context it came from and must not hold a handle to a
+runtime that may already be shut down. Prefer tens of milliseconds over one.
 
 ## Building values
 
@@ -422,6 +460,14 @@ auto b = make::polygon(ring);
 auto region = make::collection({value(a.get()), value(b.get())});
 ```
 
+Sessions cancel their live queries when they go away, as of surrealdb.c 0.2.6.
+`detach()` and `reset()` both retire the session's live queries — so do the
+authentication calls, `signin`, `signup`, `authenticate`, `refresh` and
+`invalidate`, since the caller those queries were authorised for no longer
+exists. Each cancelled query emits one final notification with
+`action::killed`, which is the signal that nothing further is coming for it. A
+reader that ignores `killed` waits for events that can no longer arrive.
+
 Members are copied, so they stay yours. **Every member must be a geometry** —
 pass anything else and you get a `none` value rather than a half-built
 collection, so check the kind when the members came from somewhere you don't
@@ -450,6 +496,17 @@ default-constructed `options` changes nothing. Unlike the C struct, the target
 names are owned, so they cannot dangle. A name that cannot be parsed is an
 error, never a silent skip — quietly widening a sandbox is the one outcome that
 must not happen.
+
+One option deserves reading before you set it. `session_dir` persists RPC
+sessions across restarts, and **those files hold credentials**: a session is
+serialised whole, including its authentication token, its record-authentication
+data and its variables, as plain JSON. Nothing is encrypted, so anything that
+can read the file can replay the session. surrealdb.c restricts the directory to
+the current user (0700/0600 on unix; elsewhere the inherited ACL is all there
+is), which is enough on a server — the case it was built for. It is not disk
+encryption. Keep it off shared or synced volumes, and think hard before enabling
+it on hardware the end user controls, where "the current user" and "the
+attacker" are the same account. Left unset, nothing is written.
 
 ## Building
 
@@ -609,8 +666,12 @@ rather than through a generator.
   build here pins a newer CMake for its Ninja C23/C++23 codegen fixes.
 - A **C++17** compiler. That is the floor, not the target: see
   [Standards](#standards).
-- [surrealdb.c](https://github.com/surrealdb/surrealdb.c) — found automatically,
-  or cloned if missing.
+- [surrealdb.c](https://github.com/surrealdb/surrealdb.c) **v0.2.6 or newer** —
+  found automatically, or cloned if missing. The floor is asserted twice: at
+  configure time when the header can be located, and by a `static_assert` in
+  `detail/c_api.hpp` that fires wherever the headers come from. Building against
+  an older copy fails with a sentence rather than an undeclared identifier
+  halfway down a header you did not write.
 - A **Rust toolchain** (`cargo`), unless surrealdb.c is already installed. The C
   SDK is a Rust staticlib and is built from source; `find_package(surrealdb_c)`
   finding an installed one is what lets you skip this.
