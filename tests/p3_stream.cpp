@@ -11,7 +11,9 @@
 #include <surrealdb/surrealdb.hpp>
 
 #include <cstdio>
+#include <chrono>
 #include <cstring>
+#include <optional>
 #include <string>
 
 namespace sdb = surrealdb;
@@ -40,6 +42,23 @@ sdb::result<sdb::stream> live_on(sdb::connection& db, const char* table) {
     std::snprintf(stmt, sizeof(stmt), "DEFINE TABLE %s SCHEMALESS", table);
     (void)db.query(stmt);
     return db.live(table);
+}
+
+// One notification, with a deadline.
+//
+// surrealdb.c 0.3.1 withdrew the unbounded read, so every read in this file is
+// bounded -- see stream.hpp for why. `nullopt` means the stream ended, failed,
+// or stayed quiet for the whole budget; the callers here distinguish those by
+// what they already know.
+std::optional<sdb::notification> wait_one(sdb::stream& s, int tries = 60) {
+    for (int i = 0; i < tries; ++i) {
+        auto p = s.next_for(std::chrono::milliseconds(50));
+        if (!p.has_value()) return std::nullopt;
+        if (p.value().timed_out()) continue;
+        if (p.value().ended()) return std::nullopt;
+        return p.value().take();
+    }
+    return std::nullopt;
 }
 
 // Produce an event the blocked reader is guaranteed to pick up.
@@ -83,18 +102,15 @@ void test_receives_a_notification() {
 
     touch(db, "p3_tbl:one");
 
-    auto n = stream.next();
+    auto n = wait_one(stream);
     CHECK(n.has_value());
     if (!n.has_value()) {
-        std::printf("  next failed: %.*s\n",
-                    static_cast<int>(n.error().message().size()),
-                    n.error().message().data());
+        std::printf("  no notification within the budget\n");
         stream.close();
         return;
     }
-    CHECK(n.value().has_value());
-    if (n.value().has_value()) {
-        const sdb::notification& note = *n.value();
+    {
+        const sdb::notification& note = *n;
         CHECK(note.action() == sdb::action::create);
         CHECK(std::strcmp(sdb::to_string(note.action()), "create") == 0);
         CHECK(note.query_id().bytes != nullptr);
@@ -123,14 +139,22 @@ void test_iteration() {
         touch(db, id);
     }
 
-    // Break *inside* the body rather than testing a counter in the loop
-    // condition: a for-loop runs `++it` before re-testing, so the counter
-    // version blocks forever waiting for an event after the last one. That is
-    // a property of the stream, not of this test -- see stream.hpp.
+    // Driven by hand, because a live stream is no longer a range: an iterator
+    // has no way to say "nothing yet", so it would either park forever or end
+    // the range on a quiet moment. Deleted in stream.hpp with that reason, and
+    // this is what replaces it -- the caller decides what a timeout means, and
+    // here it means keep going until the count is reached.
     int seen = 0;
-    for (auto it = stream.begin(); it != stream.end(); ++it) {
-        CHECK(it->action() == sdb::action::create);
-        if (++seen == want) break;
+    for (int i = 0; i < 120 && seen < want; ++i) {
+        auto p = stream.next_for(std::chrono::milliseconds(50));
+        CHECK(p.has_value());
+        if (!p.has_value()) break;
+        if (p.value().timed_out()) continue;
+        if (p.value().ended()) break;
+        auto note = p.value().take();
+        CHECK(note.has_value());
+        if (note.has_value()) CHECK(note.value().action() == sdb::action::create);
+        ++seen;
     }
     CHECK(seen == want);
 
@@ -148,10 +172,15 @@ void test_end_of_stream_is_not_success() {
 
     stream.close();
 
-    // After close, next() reports exhaustion rather than blocking or erroring.
-    auto n = stream.next();
-    CHECK(n.has_value());
-    CHECK(n.has_value() && !n.value().has_value());
+    // After close, a read reports the end rather than erroring. This is the
+    // C++-side short-circuit, not the C's SR_CLOSED -- an sr_stream_t cannot be
+    // made to report its own end at all; p13 covers what is actually reachable.
+    auto p = stream.try_next();
+    CHECK(p.has_value());
+    if (p.has_value()) {
+        CHECK(p.value().ended());
+        CHECK(!p.value().timed_out());
+    }
     CHECK(stream.done());
 }
 
@@ -166,11 +195,11 @@ void test_notification_owns_its_payload() {
 
     touch(db, "p3_own:one");
 
-    auto n = stream.next();
-    if (n.has_value() && n.value().has_value()) {
-        // Moving the notification out of the result must not double-free; the
-        // payload is released exactly once, when this scope ends.
-        sdb::notification held = std::move(n).value().value();
+    auto n = wait_one(stream);
+    if (n.has_value()) {
+        // Moving the notification out must not double-free; the payload is
+        // released exactly once, when this scope ends.
+        sdb::notification held = std::move(*n);
         CHECK(held.data().kind() != sdb::value_kind::none);
     }
     stream.close();

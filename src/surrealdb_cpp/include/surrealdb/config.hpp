@@ -214,9 +214,9 @@
 // as macros for `#if` and as constants below for module consumers.
 
 #define SURREALDB_CPP_VERSION_MAJOR 0
-#define SURREALDB_CPP_VERSION_MINOR 1
-#define SURREALDB_CPP_VERSION_PATCH 1
-#define SURREALDB_CPP_VERSION_STRING "0.1.1"
+#define SURREALDB_CPP_VERSION_MINOR 2
+#define SURREALDB_CPP_VERSION_PATCH 0
+#define SURREALDB_CPP_VERSION_STRING "0.2.0"
 
 /// Comparable as one number: 0.1.0 is 100, 1.2.3 is 10203.
 #define SURREALDB_CPP_VERSION                       \

@@ -12,10 +12,16 @@
 ///
 /// Collapsing `timed_out` into `ended` turns a merely slow notification into an
 /// abandoned stream. Collapsing it the other way turns a finished stream into a
-/// spin. surrealdb.c 0.2.6 went out of its way to keep them apart -- `SR_TIMEOUT`
-/// is a distinct code from `SR_NONE`, and its header says so at length -- so
-/// flattening them back into an empty `optional`, which cannot say which it was,
-/// would undo that at the boundary.
+/// spin. surrealdb.c goes out of its way to keep them apart, and its header says
+/// so at length, so flattening them back into an empty `optional` -- which
+/// cannot say which it was -- would undo that at the boundary.
+///
+/// The C spells the distinction on the **sign** as of 0.3.0: `> 0` is a value,
+/// `== 0` (`SR_NONE`) is "not yet, still open", and `< 0` is "stop", with
+/// `SR_CLOSED` the clean end and anything else a failure. Before that it was a
+/// dedicated `SR_TIMEOUT` code, and the end of a stream had two different
+/// encodings depending on which call you held. The three states here did not
+/// change; only what the C returns for them did.
 ///
 /// `result<poll<T>>` is therefore four states: failed, ended, timed out, ready.
 /// Every one of them has to be handled by a reader that loops, which is the
@@ -54,8 +60,12 @@ enum class poll_state : int {
 
 namespace detail {
 
-/// Convert a `std::chrono::duration` to the `int` milliseconds the C API takes,
-/// with `poll(2)` semantics: negative waits forever, zero polls once.
+/// Convert a `std::chrono::duration` to the `int` milliseconds the C API takes.
+///
+/// Zero polls once and returns. Negative is **rejected** by surrealdb.c 0.3.1
+/// with `SR_ERROR` -- it used to mean "wait forever", and stopped meaning that
+/// when the unbounded read was withdrawn. Nothing here ever sends one, which is
+/// why the clamping below is load-bearing rather than merely defensive.
 ///
 /// Written as a plain cast this is wrong three separate ways, and two of them
 /// fail *silently* in the dangerous direction:
@@ -67,9 +77,9 @@ namespace detail {
 ///   `int`, and negative means "wait forever". A bounded wait must never
 ///   quietly become unbounded, so it clamps -- to about 24 days, which is
 ///   indistinguishable from forever for anyone who meant it.
-/// - **Negative input.** `-5s` would read as "wait forever" too. It clamps to
-///   zero: whatever a caller passing a negative duration meant, it was not
-///   "block this thread until the process is killed".
+/// - **Negative input.** `-5s` clamps to zero. Against 0.2.x it would have meant
+///   "wait forever"; against 0.3.1 it is an outright `SR_ERROR`. Neither is what
+///   a caller passing a negative duration meant, and a poll-once is.
 ///
 /// The `!(x > 0)` spellings are deliberate -- they take the safe branch for a
 /// NaN count, which a `duration<double>` can carry.

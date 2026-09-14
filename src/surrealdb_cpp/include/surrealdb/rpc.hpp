@@ -30,7 +30,9 @@
 #include "detail/owned.hpp"
 #include "error.hpp"
 #include "options.hpp"
+#include "object.hpp"
 #include "poll.hpp"
+#include "results.hpp"
 #include "value.hpp"
 
 #include <chrono>
@@ -227,6 +229,8 @@ public:
         done_ = true;
         // SR_CLOSED is the ordinary end of a stream, not a failure -- it is
         // what a caller gets for shutting the context down on purpose.
+        // `SR_NONE` never comes back from a blocking read; folded in for the
+        // same reason `stream::next` folds it in.
         if (rc == SR_CLOSED || rc == SR_NONE) return owned_byte_array();
 
         return error(static_cast<error_code>(rc), owned_string());
@@ -322,19 +326,20 @@ private:
         if (rc > 0) return poll<owned_byte_array>(owned_byte_array(out, rc));
 
         // Still live -- come back. Must not reach the `done_` below.
-        if (rc == SR_TIMEOUT) return poll<owned_byte_array>(poll_state::timed_out);
+        // `SR_NONE` as of 0.3.0; see the note in `stream::next_timeout_ms`.
+        if (rc == SR_NONE) return poll<owned_byte_array>(poll_state::timed_out);
 
         done_ = true;
         // SR_CLOSED is the ordinary end here, as in `next()`: it is what
-        // shutting the context down on purpose produces.
-        if (rc == SR_CLOSED || rc == SR_NONE)
-            return poll<owned_byte_array>(poll_state::ended);
+        // shutting the context down on purpose produces. Both readers now
+        // agree on this code, which they did not before 0.3.0.
+        if (rc == SR_CLOSED) return poll<owned_byte_array>(poll_state::ended);
 
         return error(static_cast<error_code>(rc), owned_string());
     }
 
     friend class rpc;
-    rpc_stream(sr_RpcStream* raw, std::weak_ptr<const void> alive) noexcept
+    rpc_stream(sr_rpc_stream_t* raw, std::weak_ptr<const void> alive) noexcept
         : handle_(raw), alive_(std::move(alive)) {}
 
     owned_rpc_stream handle_;
@@ -434,6 +439,36 @@ public:
         return execute_on(session, request.data(), static_cast<int>(request.size()));
     }
 
+    /// Run a query on a session and get typed results back.
+    ///
+    /// Until surrealdb.c 0.3.0 this was the hole in the session model: the
+    /// typed calls (`query`, `select`, `create`, ...) live on `connection`,
+    /// which has no sessions, while sessions live here where everything had to
+    /// be hand-encoded as CBOR. A proxy holding one session per client could
+    /// not run an ordinary query for one of them without bringing its own codec.
+    ///
+    /// This is the bridge, and it returns the same `query_results` that
+    /// `connection::query` does -- including the per-statement error channel,
+    /// so one failed statement does not discard the rows the others returned.
+    /// Per-session state applies: whatever that session did with `USE`, with
+    /// authentication, or with `LET`.
+    ///
+    /// `vars` binds query variables exactly as on `connection::query`, and
+    /// passing none is distinct from passing an empty object -- the C omits the
+    /// parameter entirely rather than sending an empty map, because core
+    /// distinguishes the two when validating params.
+    [[nodiscard]] result<query_results> query_on(
+            const session_id& session, const char* surql,
+            const object_builder* vars = nullptr) noexcept {
+        sr_arr_res_t* out = nullptr;
+        return track(detail::invoke<query_results>(
+            [&](sr_string_t* e) {
+                return ::sr_rpc_query_on(raw(), e, &out, session.raw(), surql,
+                                         vars ? vars->raw() : nullptr);
+            },
+            [&](int n) { return query_results(owned_arr_results(out, n)); }));
+    }
+
     // -- sessions ------------------------------------------------------------
 
     /// Register a new session, letting the server pick the id.
@@ -511,7 +546,7 @@ public:
 
     /// Open the notification channel. One per context.
     [[nodiscard]] result<rpc_stream> notifications() noexcept {
-        sr_RpcStream* raw_stream = nullptr;
+        sr_rpc_stream_t* raw_stream = nullptr;
         auto r = track(detail::invoke([&](sr_string_t* e) {
             return ::sr_surreal_rpc_notifications(raw(), e, &raw_stream);
         }));

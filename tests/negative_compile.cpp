@@ -11,6 +11,8 @@
 
 #include <surrealdb/surrealdb.hpp>
 
+#include <chrono>
+
 namespace sdb = surrealdb;
 
 #ifndef SURREALDB_NEG_CASE
@@ -44,6 +46,9 @@ int main() {
     if (live) {
         sdb::stream s = std::move(live).value();
         auto polled = s.try_next();
+        // The bounded reads are the whole surface now; both must keep working.
+        auto bounded = s.next_for(std::chrono::milliseconds(1));
+        (void)bounded;
         if (polled) {
             auto& p = polled.value();
             if (p.ready()) { auto n = p.take(); (void)n; }
@@ -108,6 +113,24 @@ int main() {
         sdb::stream s = std::move(live2).value();
         auto&& n = *s.try_next().value();
         (void)n;
+    }
+
+#elif SURREALDB_NEG_CASE == 9
+    // The unbounded stream read, withdrawn in surrealdb.c 0.3.1. A reader
+    // parked here on a killed live query could not be released by anything.
+    auto live3 = db.live("t");
+    if (live3) {
+        sdb::stream s = std::move(live3).value();
+        auto n = s.next();
+        (void)n;
+    }
+
+#elif SURREALDB_NEG_CASE == 10
+    // A live stream is not a range: an iterator cannot say "nothing yet".
+    auto live4 = db.live("t");
+    if (live4) {
+        sdb::stream s = std::move(live4).value();
+        for (auto& n : s) (void)n;
     }
 
 #endif

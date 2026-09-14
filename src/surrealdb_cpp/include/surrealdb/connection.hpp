@@ -384,6 +384,19 @@ public:
     }
 
     /// Kill a live query by its id, as reported by `notification::query_id`.
+    ///
+    /// **This strands any `stream` open on that query.** Delivery stops, but
+    /// the stream stays open forever: it goes quiet and never reports its end,
+    /// because a killed live query cannot be observed to end on this path. That
+    /// is an upstream core defect rather than anything either library can work
+    /// around, and `REMOVE TABLE` strands a stream the same way, so it is a
+    /// property of the path and not of this call.
+    ///
+    /// To retire a live query you hold a `stream` for, call `stream::close()`
+    /// instead -- it stops the query by a route the defect does not touch and
+    /// releases the stream in the same step. Reach for `kill()` only for a
+    /// query registered some other way, such as a bare `LIVE SELECT` run
+    /// through `query()`, where there is no stream to strand.
     [[nodiscard]] result<void> kill(const char* query_id) noexcept {
         return track(detail::invoke([&](sr_string_t* e) {
             return ::sr_kill(raw(), e, query_id);

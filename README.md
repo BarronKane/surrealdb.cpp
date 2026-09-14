@@ -185,29 +185,46 @@ at runtime.
 auto s = db.live("person");
 auto stream = std::move(s).value();
 
-while (auto n = stream.next()) {
-    if (!n.value()) break;              // stream ended
-    handle(n.value()->action(), n.value()->data());
+for (;;) {
+    auto r = stream.next_for(std::chrono::milliseconds(250));
+    if (!r) break;                          // the stream failed
+
+    auto& p = r.value();
+    if (p.ended()) break;                   // the stream finished
+    if (p.timed_out()) {                    // nothing yet
+        if (shutting_down) break;
+        continue;
+    }
+    auto n = p.take();
+    handle(n->action(), n->data());
 }
+stream.close();
 ```
 
 Three things about this API are worth knowing before you use it:
 
-- **`next()` blocks, and cannot be cancelled.** A reader parked in it cannot be
-  released from another thread, because killing the stream frees the very thing
-  that reader is using. Call it only when an event is expected, from a dedicated
-  thread. `next_for()` below is the way out of that.
+- **Every read is bounded, and that is not a convenience.** surrealdb.c 0.3.1
+  withdrew the unbounded `next()` entirely, because a reader parked in it had no
+  exit — see [Ending a live query](#ending-a-live-query). `next()` and range-for
+  are `= delete`d here with that reason attached, rather than merely absent, so
+  code written against the old shape is told what to do. A long bound is cheap:
+  the wait is a real timer, so `next_for(std::chrono::hours(1))` costs what
+  blocking for an hour would have cost and still returns.
+- **A live stream is not a range.** An iterator has two answers — here is an
+  element, or the range is over — and a bounded read has three. The third,
+  "nothing yet", has nowhere to go: advancing on it parks forever, ending on it
+  silently truncates a live query at the first quiet moment. So you drive the
+  loop and decide for yourself what a run of timeouts means. `rpc_stream` keeps
+  its iteration, because the RPC path really does end.
 - **Teardown is ordered.** A stream borrows its connection's runtime, so it must
   be destroyed first. Natural scoping already does this; a stream moved
   somewhere longer-lived does not, and the library detects that rather than
   running a kill against a dead runtime.
-- **A range-for blocks *past* the last event you know about** — the loop
-  increments before re-testing its condition. Break from inside the body.
 
 ### Bounded waits
 
 A reader that has to stay responsive — to a shutdown flag, usually — waits with
-a bound instead. This needs **surrealdb.c 0.2.6 or newer**.
+a bound instead.
 
 ```cpp
 for (;;) {
@@ -243,6 +260,32 @@ cannot lose an event.
 is a poll at millisecond granularity rather than a timer, because an
 `rpc_stream` outlives the context it came from and must not hold a handle to a
 runtime that may already be shut down. Prefer tens of milliseconds over one.
+
+### Ending a live query
+
+**Use `stream::close()`.** It stops the underlying live query and releases the
+stream in one step.
+
+`connection::kill()` does *not* — and this is the sharp edge. It stops delivery,
+but the stream stays open forever: it goes quiet and never reports its end.
+Nothing on the database side ends one, not `KILL`, `REMOVE TABLE`,
+`REMOVE DATABASE` or `REMOVE NAMESPACE`. That is an upstream core defect rather
+than anything either library can work around, and it is the reason the unbounded
+read no longer exists: a reader parked on a killed live query had no way out at
+all. Nothing arrives, the end never comes, and killing the stream from another
+thread frees the very object that reader is borrowing.
+
+So reach for `kill()` only for a live query registered some other way — a bare
+`LIVE SELECT` run through `query()` — where there is no stream to strand. An
+`rpc_stream` does report its end, when the context it came from is destroyed.
+
+Sessions are the exception, and they are tidier about it. On an `rpc` context,
+`detach()` and `reset()` both retire the session's live queries — so do the
+authentication calls, `signin`, `signup`, `authenticate`, `refresh` and
+`invalidate`, since the caller those queries were authorised for no longer
+exists. Each cancelled query emits one final notification with
+`action::killed`, and that *is* the signal that nothing further is coming. A
+reader that ignores `killed` waits for events that can no longer arrive.
 
 ## Building values
 
@@ -411,6 +454,22 @@ so would mean vendoring a codec or taking a dependency, and the point of this
 wrapper is that it pulls in nothing. Bytes go in, bytes come out, and the codec
 stays your choice.
 
+Unless you want an ordinary query, in which case you no longer need a codec at
+all. `query_on` runs SurrealQL against a chosen session and returns the same
+`query_results` `connection::query` does, per-statement error channel included
+— **surrealdb.c 0.3.0**:
+
+```cpp
+object_builder vars;
+vars.set("id", user_id);
+auto rows = ctx.query_on(session, "SELECT * FROM person WHERE id = $id", &vars);
+```
+
+That was the hole in the session model: the typed calls live on `connection`,
+which has no sessions, while sessions live here where everything had to be
+hand-encoded. Per-session state applies — whatever that session did with `USE`,
+with authentication, or with `LET`.
+
 Note that **a successful result does not mean the query succeeded.** A parse
 error fails the call, with the server's diagnostic attached, and nothing runs.
 A *runtime* error succeeds at this level and is reported inside the reply: a
@@ -428,8 +487,8 @@ many clients without leaking authentication state between them. An id that was
 never attached is refused rather than quietly falling back.
 
 `reset` and `detach` are different on purpose: reset keeps the id valid but
-clears what the session had selected, detach removes it and cancels the live
-queries and transactions it owned.
+clears what the session had selected, detach removes it. Both cancel the
+session's live queries — see [Live queries](#live-queries).
 
 [ghsa]: https://github.com/surrealdb/surrealdb/security/advisories/GHSA-4vgr-h27g-cf9p
 
@@ -459,14 +518,6 @@ auto a = make::point(1.0, 2.0);
 auto b = make::polygon(ring);
 auto region = make::collection({value(a.get()), value(b.get())});
 ```
-
-Sessions cancel their live queries when they go away, as of surrealdb.c 0.2.6.
-`detach()` and `reset()` both retire the session's live queries — so do the
-authentication calls, `signin`, `signup`, `authenticate`, `refresh` and
-`invalidate`, since the caller those queries were authorised for no longer
-exists. Each cancelled query emits one final notification with
-`action::killed`, which is the signal that nothing further is coming for it. A
-reader that ignores `killed` waits for events that can no longer arrive.
 
 Members are copied, so they stay yours. **Every member must be a geometry** —
 pass anything else and you get a `none` value rather than a half-built
@@ -666,7 +717,7 @@ rather than through a generator.
   build here pins a newer CMake for its Ninja C23/C++23 codegen fixes.
 - A **C++17** compiler. That is the floor, not the target: see
   [Standards](#standards).
-- [surrealdb.c](https://github.com/surrealdb/surrealdb.c) **v0.2.6 or newer** —
+- [surrealdb.c](https://github.com/surrealdb/surrealdb.c) **v0.3.0 or newer** —
   found automatically, or cloned if missing. The floor is asserted twice: at
   configure time when the header can be located, and by a `static_assert` in
   `detail/c_api.hpp` that fires wherever the headers come from. Building against

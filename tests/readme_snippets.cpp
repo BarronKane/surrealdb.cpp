@@ -47,10 +47,17 @@ int main() {
     {
         auto s = db.live("person");
         auto stream = std::move(s).value();
-        while (auto n = stream.next()) {
-            if (!n.value()) break;
-            handle(n.value()->action(), n.value()->data());
+        for (;;) {
+            auto r = stream.next_for(std::chrono::milliseconds(250));
+            if (!r) break;
+
+            auto& p = r.value();
+            if (p.ended()) break;
+            if (p.timed_out()) continue;
+            auto n = p.take();
+            handle(n->action(), n->data());
         }
+        stream.close();
     }
 
     // -- Building values --
@@ -194,6 +201,15 @@ int main() {
     auto reply = ctx.execute_on(session, request_bytes);
     (void)reply;
     (void)ctx.execute(request_bytes);
+    // -- Typed queries on a session --
+    {
+        object_builder qvars;
+        qvars.set("id", "person:alice");
+        auto qrows = ctx.query_on(session,
+                                  "SELECT * FROM person WHERE id = $id", &qvars);
+        (void)qrows;
+    }
+
     (void)ctx.reset(session);
     (void)ctx.detach(session);
 }

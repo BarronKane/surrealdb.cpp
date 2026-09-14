@@ -3,25 +3,33 @@
 /// @file stream.hpp
 /// Live query notifications.
 ///
-/// Three properties of the C stream API shape everything here, and all three
-/// are easy to get wrong:
+/// Four properties of the C stream API shape everything here, and every one of
+/// them is easy to get wrong:
 ///
-/// **`next()` blocks with no cancellation.** `sr_stream_next` parks until an
-/// event arrives, and there is no way to release a parked reader from another
-/// thread -- `sr_stream_kill` frees the very stream that reader is borrowing.
-/// So `next()` belongs on a dedicated worker thread, and only when an event is
-/// expected.
+/// **Every wait is bounded, because the unbounded one was withdrawn.**
+/// surrealdb.c 0.3.1 removed `sr_stream_next` outright. A killed live query
+/// cannot be observed to end on this path -- an upstream core defect, not
+/// something either library can paper over -- so a reader parked with no
+/// deadline had no exit: nothing further arrives, `SR_CLOSED` never comes, and
+/// `sr_stream_kill` frees the very stream that reader is borrowing, so no other
+/// thread can release it. Only ending the process would.
 ///
-/// **`next_for()` and `try_next()` are the way out of that.** surrealdb.c 0.2.6
-/// added `sr_stream_next_timeout`, so a reader can now wait with a bound and
-/// come back to check a shutdown flag. That is the call for any thread that has
-/// to stay responsive, and it is the only way to stop a reader cooperatively:
-/// a thread parked in `next()` still cannot be released by anything short of
-/// ending the process.
+/// So `next_for()` and `try_next()` are the whole reading surface here. A long
+/// bound costs nothing -- the wait is a real timer, not a poll loop -- so an
+/// hour's bound is an hour's block that still returns. `next()` and iteration
+/// are `= delete`d with reasons rather than removed, so 0.2.x code is told what
+/// to do instead of failing as a missing member. Both come back if upstream
+/// lands the fix; the C keeps its implementation commented in place for that.
 ///
 /// A bounded wait has three outcomes rather than two -- value, timeout, end --
 /// so these return `result<poll<notification>>`; see poll.hpp for why the last
 /// two must not be merged.
+///
+/// **`close()` retires a live query; `connection::kill()` strands it.**
+/// `sr_stream_kill` stops the underlying query by a route the defect does not
+/// touch, and releases the stream in the same step. `sr_kill` stops delivery
+/// but leaves the stream open forever. So closing the stream is the way to end
+/// a live query you own.
 ///
 /// **Teardown is ordered.** A stream borrows the runtime owned by its
 /// connection, so the stream must be killed *before* the connection is
@@ -34,10 +42,18 @@
 /// gone: leaking one stream is a great deal better than running a kill against
 /// a dead runtime.
 ///
-/// **`sr_stream_next` does not use SR_CLOSED.** It returns 1 with a
-/// notification, `SR_NONE` (0) at end of stream, and a negative status on
-/// error. Treating 0 as success is the mistake the C suite's own test was
-/// written to catch.
+/// **The status codes split on the sign, and 0 does not mean success.**
+/// `> 0` is a notification, `< 0` says stop -- `SR_CLOSED` for a clean end,
+/// anything else a failure -- and `== 0` (`SR_NONE`) means "nothing yet, the
+/// stream is still open".
+///
+/// This changed in surrealdb.c 0.3.0 and changed *silently*: the end of a
+/// stream used to be `SR_NONE` and is now `SR_CLOSED`, while `SR_NONE` went the
+/// other way and now means not-yet. Both misreadings look plausible at run
+/// time, which is why this file works from the sign rather than from a list of
+/// codes. A negative `timeout_ms` is also no longer "wait forever" -- 0.3.1
+/// rejects it with `SR_ERROR` -- which makes the clamping in
+/// `detail::to_timeout_ms` load-bearing rather than merely defensive.
 
 #include "config.hpp"
 #include "detail/c_api.hpp"
@@ -84,13 +100,25 @@ public:
     notification() noexcept = default;
     explicit notification(sr_notification_t raw) noexcept : n_(raw) {}
 
+    // Both of these go through `addr()`, not `get()`.
+    //
+    // `owned::get()` returns the handle **by value**, and this handle is a
+    // struct: `n_.get().query_id._0` takes a pointer into a temporary that
+    // dies at the end of the full-expression, and `uuid_ref` is nothing but
+    // that pointer. It read a dead stack frame -- ids that changed between
+    // calls and carried recognisable fragments of x86-64 pointers where the
+    // UUID version nibble should be. `action()` was safe only by accident,
+    // because it copies an int out before the temporary dies; using `addr()`
+    // for both means the next member added here cannot pick the wrong one.
     [[nodiscard]] surrealdb::action action() const noexcept {
-        return static_cast<surrealdb::action>(n_.get().action);
+        return static_cast<surrealdb::action>(n_.addr()->action);
     }
 
     /// The live query this came from.
+    ///
+    /// Borrows from this notification, like `data()`, so it must not outlive it.
     [[nodiscard]] uuid_ref query_id() const noexcept {
-        return uuid_ref{n_.get().query_id._0};
+        return uuid_ref{n_.addr()->query_id._0};
     }
 
     /// The record. Borrows from this notification, so it must not outlive it.
@@ -141,30 +169,31 @@ public:
         return failed_ ? &failure_ : nullptr;
     }
 
-    /// Block until the next notification.
+    /// The unbounded read, removed in surrealdb.c 0.3.1.
     ///
-    /// `nullopt` means the stream ended cleanly. An error result means it
-    /// failed; either way the stream is finished afterwards.
+    /// `sr_stream_next` is gone -- no declaration, no symbol -- and this is
+    /// deleted rather than left to fail as a missing member so that code
+    /// written against 0.2.x gets told what to do instead.
     ///
-    /// An unbounded wait cannot time out, so two states suffice here and the
-    /// `optional` stays. `next_for()` is the one that needs a third.
-    [[nodiscard]] result<std::optional<notification>> next() noexcept {
-        if (done_ || !handle_) return std::optional<notification>{};
-
-        sr_notification_t raw{};
-        const int rc = ::sr_stream_next(handle_.get(), &raw);
-
-        if (rc > 0) return std::optional<notification>(notification(raw));
-
-        // SR_NONE here is end-of-stream, not success. Anything else is a
-        // failure. Both finish the stream.
-        done_ = true;
-        if (rc == 0) return std::optional<notification>{};
-
-        failed_ = true;
-        failure_ = error(static_cast<error_code>(rc), owned_string());
-        return error(static_cast<error_code>(rc), owned_string());
-    }
+    /// The reason is not tidiness. A killed live query cannot be observed to
+    /// end on this path (an upstream core defect, documented on `kill()`), so a
+    /// reader parked here had no exit at all: nothing further arrives,
+    /// `SR_CLOSED` never comes, and `sr_stream_kill` frees the very stream that
+    /// reader is borrowing, so another thread cannot release it either. The
+    /// process had to die. surrealdb.c withdrew the call rather than document
+    /// that as a caveat and let callers walk into it.
+    ///
+    /// `next_for()` replaces it, and a long bound is cheap -- the wait is a
+    /// real timer, so `next_for(std::chrono::hours(1))` costs what blocking for
+    /// an hour would have cost and still returns.
+    ///
+    /// It comes back when the upstream fix lands; the C keeps its
+    /// implementation commented in place for exactly that.
+    result<std::optional<notification>> next()
+        SURREALDB_DELETED("surrealdb.c 0.3.1 withdrew the unbounded stream read: "
+                          "a killed live query never reports its end, so a parked "
+                          "reader could not be released by anything. Use next_for() "
+                          "with a bound, or try_next().");
 
     /// Wait for the next notification, giving up after `timeout`.
     ///
@@ -209,7 +238,13 @@ public:
         return next_timeout_ms(0);
     }
 
-    /// Close the stream early. Safe to call more than once.
+    /// Close the stream early, and with it the live query. Safe to call more
+    /// than once.
+    ///
+    /// This is the way to retire a live query you own: it stops the underlying
+    /// query by a route the upstream KILL defect does not touch, and releases
+    /// the stream in the same step. `connection::kill()` does not -- see its
+    /// note.
     void close() noexcept {
         done_ = true;
         if (handle_ && alive_.expired()) {
@@ -219,69 +254,39 @@ public:
         handle_.reset();
     }
 
-    // -- iteration ----------------------------------------------------------
+    // -- iteration, withdrawn with the blocking read -------------------------
     //
-    // **A range-for over a live stream blocks past the last event you know
-    // about.** `for (...; it != end(); ++it)` runs the increment *before*
-    // re-testing the condition, so a loop bounded by a counter in its condition
-    // parks on an event that never comes. Since there is no cancellation, that
-    // is a hang, not a delay.
+    // A range cannot express this stream any more, and the failure modes of
+    // pretending otherwise are both bad.
     //
-    // Either break from inside the body:
+    // An iterator has exactly two answers: here is an element, or the range is
+    // over. A bounded read has three, and the third -- "nothing yet, still
+    // open" -- is the one with nowhere to go. Advancing on a timeout means
+    // looping until something arrives, which is the unbounded park that
+    // surrealdb.c just removed. Ending the range on a timeout means a quiet
+    // moment silently truncates a live query, which is worse: it looks like
+    // success.
     //
-    //     for (auto it = s.begin(); it != s.end(); ++it) {
-    //         handle(*it);
-    //         if (enough()) break;
-    //     }
+    // So iteration is deleted rather than quietly redefined. Drive `next_for()`
+    // in a loop and decide for yourself what a run of timeouts means -- that
+    // decision is the caller's and cannot be made here.
     //
-    // or drive it with next(), which is the honest primitive for a consumer
-    // that decides when to stop. The range is for the worker-thread case that
-    // genuinely wants every event until the stream ends.
+    // `rpc_stream` keeps its iteration. The RPC path has no such defect: its
+    // stream really does end when the context is destroyed, so `next()` there
+    // still terminates and a range over it still means something.
 
-    class iterator {
-    public:
-        using iterator_category = std::input_iterator_tag;
-        using value_type        = notification;
-        using difference_type   = std::ptrdiff_t;
-        using reference         = notification&;
-        using pointer           = notification*;
+    class iterator;   // not defined
 
-        iterator() noexcept = default;
-        explicit iterator(stream* s) noexcept : s_(s) { advance(); }
-
-        [[nodiscard]] reference operator*() noexcept { return current_; }
-        [[nodiscard]] pointer operator->() noexcept { return &current_; }
-
-        iterator& operator++() noexcept { advance(); return *this; }
-        void operator++(int) noexcept { advance(); }
-
-        [[nodiscard]] friend bool operator==(const iterator& a, const iterator& b) noexcept {
-            return a.s_ == b.s_;
-        }
-        [[nodiscard]] friend bool operator!=(const iterator& a, const iterator& b) noexcept {
-            return !(a == b);
-        }
-
-    private:
-        void advance() noexcept {
-            if (!s_) return;
-            auto r = s_->next();
-            if (!r.has_value() || !r.value().has_value()) {
-                s_ = nullptr;          // becomes the end iterator
-                return;
-            }
-            current_ = std::move(r).value().value();
-        }
-
-        stream* s_{nullptr};
-        notification current_;
-    };
-
-    using const_iterator = iterator;
-
-    /// Begins by blocking for the first notification.
-    [[nodiscard]] iterator begin() noexcept { return iterator(this); }
-    [[nodiscard]] iterator end() noexcept { return iterator(); }
+    iterator begin()
+        SURREALDB_DELETED("a live stream is no longer a range: a bounded read can "
+                          "report 'nothing yet', which an iterator cannot express "
+                          "without either parking forever or silently ending the "
+                          "range. Loop on next_for() instead.");
+    iterator end()
+        SURREALDB_DELETED("a live stream is no longer a range: a bounded read can "
+                          "report 'nothing yet', which an iterator cannot express "
+                          "without either parking forever or silently ending the "
+                          "range. Loop on next_for() instead.");
 
 private:
     /// The shared body of `next_for` and `try_next`.
@@ -302,10 +307,14 @@ private:
         // handling below: the stream is still live and the caller should come
         // back. Marking it done here would abandon a stream over nothing more
         // than a quiet hundred milliseconds.
-        if (rc == SR_TIMEOUT) return poll<notification>(poll_state::timed_out);
+        //
+        // This is `SR_NONE` as of 0.3.0, where it used to be `SR_TIMEOUT` and
+        // `SR_NONE` meant the opposite. Getting it wrong either abandons a
+        // healthy stream or spins on a dead one, and neither announces itself.
+        if (rc == SR_NONE) return poll<notification>(poll_state::timed_out);
 
         done_ = true;
-        if (rc == SR_NONE) return poll<notification>(poll_state::ended);
+        if (rc == SR_CLOSED) return poll<notification>(poll_state::ended);
 
         failed_ = true;
         failure_ = error(static_cast<error_code>(rc), owned_string());

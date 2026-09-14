@@ -301,6 +301,106 @@ void test_notifications_shutdown() {
     if (after) CHECK(after.value().empty());
 }
 
+// Typed queries on a session -- surrealdb.c 0.3.0's `sr_rpc_query_on`.
+//
+// This closed the hole in the session model. The typed calls live on
+// `connection`, which has no sessions; sessions live on `rpc`, where before
+// 0.3.0 every operation had to be hand-encoded as CBOR. A proxy holding one
+// session per client could not run an ordinary query for one of them without
+// bringing its own codec.
+//
+// The claim worth testing is not that it returns rows -- it is that the results
+// are *per session*. Two sessions must not see each other's state.
+void test_query_on_session(sdb::rpc& ctx) {
+    std::printf("rpc: typed queries on a session\n");
+
+    auto a = ctx.attach();
+    CHECK(a.has_value());
+    if (!a) { report("attach", a.error()); return; }
+    auto s1 = std::move(a).value();
+
+    auto b = ctx.attach();
+    CHECK(b.has_value());
+    if (!b) return;
+    auto s2 = std::move(b).value();
+    CHECK(s1 != s2);
+
+    // The same shape `connection::query` returns, per-statement channel and all.
+    {
+        auto r = ctx.query_on(s1, "RETURN 1");
+        CHECK(r.has_value());
+        if (!r) { report("query_on", r.error()); return; }
+        auto& res = r.value();
+        CHECK(res.size() == 1);
+        CHECK(res.all_ok());
+        auto rows = res.single();
+        CHECK(rows.has_value());
+        if (rows) CHECK(rows.value().size() == 1);
+    }
+
+    // Bound variables, exactly as on connection::query.
+    {
+        sdb::object_builder vars;
+        vars.set("n", 41);
+        auto r = ctx.query_on(s1, "RETURN $n + 1", &vars);
+        CHECK(r.has_value());
+        if (r) {
+            auto rows = r.value().single();
+            CHECK(rows.has_value());
+            if (rows && rows.value().size() == 1) {
+                sdb::value v = rows.value()[0];
+                auto num = v.as_int();
+                CHECK(num.has_value() && *num == 42);
+            }
+        }
+    }
+
+    // Per-statement errors: one bad statement does not discard the others.
+    {
+        auto r = ctx.query_on(s1, "RETURN 1; SELECT * FROM $$$nope; RETURN 3");
+        if (r.has_value()) {
+            auto& res = r.value();
+            CHECK(res.size() >= 1);
+        } else {
+            // A parse error fails the whole call, which is the other documented
+            // channel -- either is correct, but it must not crash or hang.
+            CHECK(!r.error().message().empty());
+        }
+    }
+
+    // The point of sessions: state set on one is invisible to the other.
+    {
+        auto set = ctx.query_on(s1, "LET $marker = 7");
+        CHECK(set.has_value());
+
+        auto mine = ctx.query_on(s1, "RETURN $marker");
+        CHECK(mine.has_value());
+        if (mine) {
+            auto rows = mine.value().single();
+            if (rows && rows.value().size() == 1) {
+                sdb::value v = rows.value()[0];
+                auto num = v.as_int();
+                CHECK(num.has_value() && *num == 7);
+            }
+        }
+
+        // The other session never saw the LET. It either errors or reports
+        // none -- what it must not do is return 7.
+        auto theirs = ctx.query_on(s2, "RETURN $marker");
+        if (theirs.has_value()) {
+            auto rows = theirs.value().single();
+            if (rows && rows.value().size() == 1) {
+                sdb::value v = rows.value()[0];
+                auto num = v.as_int();
+                CHECK(!(num.has_value() && *num == 7));
+            }
+        }
+    }
+
+    CHECK(ctx.detach(s1).has_value());
+    CHECK(ctx.detach(s2).has_value());
+}
+
 void test_stream_outliving_context() {
     std::printf("rpc: stream outliving its context\n");
 
@@ -346,6 +446,7 @@ int main() {
     test_connect_and_execute(ctx);
     test_sessions(ctx);
     test_query_over_rpc(ctx);
+    test_query_on_session(ctx);
     ctx.disconnect();
     CHECK(!ctx.valid());
 

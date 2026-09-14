@@ -1,7 +1,7 @@
 [submodule "surrealdb.c"]
 	path = surrealdb.c
 	url = https://github.com/BarronKane/surrealdb.c.git
-	branch = v0.2.6
+	branch = v0.3.1
 [submodule "ThirdParty/Unity"]
 	path = ThirdParty/Unity
 	url = https://github.com/ThrowTheSwitch/Unity.git

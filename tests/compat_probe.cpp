@@ -270,6 +270,21 @@ void probe_rpc() {
     };
     expect(ctx.execute(req).has_value(), "rpc query");
 
+    // Typed queries on a session -- 0.3.0's sr_rpc_query_on.
+    {
+        auto sid = ctx.attach();
+        expect(sid.has_value(), "rpc attach");
+        if (sid) {
+            auto s = std::move(sid).value();
+            sdb::object_builder vars;
+            vars.set("n", 1);
+            auto qr = ctx.query_on(s, "RETURN $n", &vars);
+            expect(qr.has_value(), "rpc query_on");
+            if (qr) expect(qr.value().size() == 1, "rpc query_on statements");
+            expect(ctx.detach(s).has_value(), "rpc detach");
+        }
+    }
+
     // Opened and closed without reading, for the same reason as `live`.
     auto ns = ctx.notifications();
     expect(ns.has_value(), "notifications");
@@ -305,7 +320,8 @@ void probe_poll() {
 
     expect(std::string(sdb::to_string(sdb::poll_state::timed_out)) == "timed_out",
            "poll_state to_string");
-    expect(sdb::to_string(sdb::error_code::timeout) != nullptr, "error_code timeout");
+    // 0.3.0 removed error_code::timeout; a timeout is poll_state, not a code.
+    expect(sdb::to_string(sdb::error_code::closed) != nullptr, "error_code closed");
 }
 
 } // namespace

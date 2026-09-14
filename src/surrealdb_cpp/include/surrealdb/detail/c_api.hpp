@@ -53,10 +53,17 @@ extern "C" {
 // Minimum surrealdb.c
 // ---------------------------------------------------------------------------
 //
-// This library calls functions that do not exist in every release -- 0.1.1
-// needs `sr_stream_next_timeout` and `sr_rpc_stream_next_timeout`, added in
-// surrealdb.c 0.2.6 -- and building against an older header does not fail
-// anywhere useful. It fails as an undeclared identifier partway down
+// This library calls functions that do not exist in every release -- 0.2.0
+// needs `sr_rpc_query_on`, added in surrealdb.c 0.3.0 -- and building against
+// an older header does not fail anywhere useful.
+//
+// The floor matters more than usual across 0.3.x, because those releases
+// *reassigned* and *withdrew* rather than only adding. `SR_NONE` meant "stream
+// ended" in 0.2.x and means "nothing yet, still open" from 0.3.0; a negative
+// `timeout_ms` meant "wait forever" and is an error from 0.3.1; and
+// `sr_stream_next` is gone entirely. Against a 0.2.x header the renamed types
+// fail to compile, which is a mercy -- the alternative is a build that succeeds
+// and then reads every quiet moment as a dead stream. It fails as an undeclared identifier partway down
 // stream.hpp, or, if the declaration happens to exist but the symbol does not,
 // at the link with a mangled name and no hint about which half is stale.
 //
@@ -64,16 +71,16 @@ extern "C" {
 // floor is checked, not the exact version: surrealdb.c is additive within a
 // minor, so newer is fine and only older is a problem.
 #define SURREALDB_CPP_REQUIRES_C_MAJOR 0
-#define SURREALDB_CPP_REQUIRES_C_MINOR 2
-#define SURREALDB_CPP_REQUIRES_C_PATCH 6
+#define SURREALDB_CPP_REQUIRES_C_MINOR 3
+#define SURREALDB_CPP_REQUIRES_C_PATCH 1
 
 #if !defined(SR_VERSION)
-#  error "surrealdb.h defines no SR_VERSION. surrealdb.cpp needs surrealdb.c v0.2.6 or newer."
+#  error "surrealdb.h defines no SR_VERSION. surrealdb.cpp needs surrealdb.c v0.3.1 or newer."
 #endif
 
 static_assert(SR_VERSION >= SR_VERSION_ENCODE(SURREALDB_CPP_REQUIRES_C_MAJOR,
                                               SURREALDB_CPP_REQUIRES_C_MINOR,
                                               SURREALDB_CPP_REQUIRES_C_PATCH),
-              "surrealdb.cpp requires surrealdb.c v0.2.6 or newer "
+              "surrealdb.cpp requires surrealdb.c v0.3.1 or newer "
               "(SR_VERSION_STRING reports what was actually found). Update the "
               "surrealdb.c submodule, or point SURREALDB_C_ROOT at a newer one.");

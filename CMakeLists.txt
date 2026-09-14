@@ -16,7 +16,7 @@ if(APPLE AND EXISTS "${_sdb_apple_module}")
     include("${_sdb_apple_module}")
 endif()
 
-project(surrealdb_cpp VERSION 0.1.1 LANGUAGES C CXX)
+project(surrealdb_cpp VERSION 0.2.0 LANGUAGES C CXX)
 
 # ============================================================================
 # Git Submodules
@@ -233,7 +233,8 @@ find_package(surrealdb_c REQUIRED)
 
 # --- minimum surrealdb.c -----------------------------------------------------
 #
-# 0.1.1 calls `sr_stream_next_timeout`, which arrived in surrealdb.c 0.2.6.
+# 0.2.0 calls `sr_rpc_query_on` (surrealdb.c 0.3.0) and relies on the bounded
+# stream reads that 0.3.1 made the only ones.
 # `detail/c_api.hpp` static_asserts this and is the real backstop -- it fires
 # wherever the headers come from, including an installed package this module
 # never looked inside. Checking here as well only buys an earlier and more

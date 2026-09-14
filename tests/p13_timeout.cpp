@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstdio>
 #include <limits>
+#include <optional>
 #include <string>
 
 namespace sdb = surrealdb;
@@ -150,15 +151,30 @@ void test_poll_take() {
     CHECK(t.timed_out());
 }
 
-void test_error_code_timeout() {
-    std::printf("timeout: error_code mirror\n");
+// The status codes, and the sign contract the readers are written against.
+//
+// surrealdb.c 0.3.0 deleted SR_TIMEOUT and gave SR_NONE its job, so a timeout
+// now shares an encoding with an ordinary success. That is safe only because
+// the bounded readers translate it into `poll_state::timed_out` before it can
+// reach a `result` -- these checks pin the encoding those readers depend on.
+void test_status_codes() {
+    std::printf("timeout: status codes\n");
 
-    // Mirrored so the enum stays a complete map of the C codes...
-    CHECK(static_cast<int>(sdb::error_code::timeout) == SR_TIMEOUT);
-    CHECK(std::string(sdb::to_string(sdb::error_code::timeout)) == "timeout");
-    // ...but it is not a success, and the readers below prove it never
-    // actually reaches an error.
-    CHECK(!sdb::is_ok(sdb::error_code::timeout));
+    // Exactly four, and no `timeout` among them any more.
+    CHECK(static_cast<int>(sdb::error_code::ok) == 0);
+    CHECK(static_cast<int>(sdb::error_code::closed) == -1);
+    CHECK(static_cast<int>(sdb::error_code::error) == -2);
+    CHECK(static_cast<int>(sdb::error_code::fatal) == -3);
+
+    CHECK(static_cast<int>(sdb::error_code::ok) == SR_NONE);
+    CHECK(static_cast<int>(sdb::error_code::closed) == SR_CLOSED);
+
+    // The sign contract: > 0 a value, == 0 not yet, < 0 stop. `closed` is the
+    // one negative code that is not a failure.
+    CHECK(sdb::is_ok(sdb::error_code::ok));
+    CHECK(!sdb::is_ok(sdb::error_code::closed));
+    CHECK(std::string(sdb::to_string(sdb::error_code::closed)) == "closed");
+    CHECK(std::string(sdb::to_string(sdb::error_code::ok)) == "ok");
 }
 
 // -- stream -----------------------------------------------------------------
@@ -280,6 +296,232 @@ void test_timeout_then_event() {
     CHECK(got);
 }
 
+// Regression: the notification's query_id used to be a dangling pointer.
+//
+// `notification::query_id()` read `n_.get().query_id._0`, and `owned::get()`
+// returns the handle *by value* -- so the pointer went into a temporary
+// `sr_notification_t` that died at the end of the expression, and `uuid_ref` is
+// nothing but that pointer. It read a dead stack frame.
+//
+// It survived because the only check on it was `bytes != nullptr`, which a
+// dangling pointer satisfies. The ids it produced were visibly wrong once
+// anyone looked: no version nibble, changing between reads, and carrying
+// recognisable halves of x86-64 pointers. A live query could not be killed,
+// because the id handed to KILL was garbage.
+//
+// So this checks the bytes mean something, twice over: well-formed as a UUID,
+// and the same across two notifications from one live query.
+void test_notification_query_id() {
+    std::printf("timeout: notification query_id is real\n");
+    auto db = open();
+    if (!db.valid()) { std::printf("  no connection; skipped\n"); return; }
+
+    auto s = live_on(db, "p13_qid");
+    if (!s.has_value()) { std::printf("  live unavailable; skipped\n"); return; }
+    auto stream = std::move(s).value();
+
+    touch(db, "p13_qid:a");
+    touch(db, "p13_qid:b");
+
+    std::uint8_t seen[2][16] = {};
+    int got = 0;
+    for (int i = 0; i < 60 && got < 2; ++i) {
+        auto p = stream.next_for(50ms);
+        CHECK(p.has_value());
+        if (!p.has_value()) return;
+        if (p.value().timed_out()) continue;
+        if (p.value().ended()) break;
+        auto n = p.value().take();
+        if (!n.has_value()) break;
+        const std::uint8_t* b = n.value().query_id().bytes;
+        CHECK(b != nullptr);
+        if (b == nullptr) return;
+        for (int j = 0; j < 16; ++j) seen[got][j] = b[j];
+        ++got;
+    }
+    if (got == 0) { std::printf("  no notifications; skipped\n"); return; }
+
+    // A live query id is a v4 UUID: version nibble 4, variant bits 0b10.
+    CHECK((seen[0][6] >> 4) == 0x4);
+    CHECK((seen[0][8] >> 6) == 0x2);
+
+    // Not all-zero, which is what a zeroed struct would give.
+    bool any = false;
+    for (int j = 0; j < 16; ++j) any = any || seen[0][j] != 0;
+    CHECK(any);
+
+    // Two notifications from one live query carry one id. A dangling read gives
+    // a different answer each time.
+    if (got == 2) {
+        bool same = true;
+        for (int j = 0; j < 16; ++j) same = same && seen[0][j] == seen[1][j];
+        CHECK(same);
+    }
+}
+
+// KILL stops delivery, and does *not* end the stream.
+//
+// Both halves are asserted because both are load-bearing. The first is what
+// makes a correct query_id observable end-to-end. The second is the upstream
+// core defect that surrealdb.c 0.3.1 documents and works around: nothing on the
+// database side ends an `sr_stream_t` -- not KILL, not REMOVE
+// TABLE/DATABASE/NAMESPACE -- which is why the unbounded read was withdrawn
+// entirely. The bounded reader must keep reporting `timed_out` rather than
+// inventing an end or a failure.
+//
+// When the upstream fix lands this starts failing on `!ended`, which is the
+// right way to find out. `stream::close()` is the supported way to retire one
+// of these in the meantime.
+void test_kill_stops_delivery() {
+    std::printf("timeout: KILL stops delivery\n");
+    auto db = open();
+    if (!db.valid()) { std::printf("  no connection; skipped\n"); return; }
+
+    auto s = live_on(db, "p13_kill");
+    if (!s.has_value()) { std::printf("  live unavailable; skipped\n"); return; }
+    auto stream = std::move(s).value();
+
+    touch(db, "p13_kill:a");
+
+    std::string query_id;
+    for (int i = 0; i < 60 && query_id.empty(); ++i) {
+        auto p = stream.next_for(50ms);
+        if (!p.has_value()) return;
+        if (p.value().timed_out()) continue;
+        if (p.value().ended()) break;
+        auto n = p.value().take();
+        if (!n.has_value()) break;
+        static const char* hex = "0123456789abcdef";
+        const std::uint8_t* b = n.value().query_id().bytes;
+        for (int j = 0; j < 16; ++j) {
+            if (j == 4 || j == 6 || j == 8 || j == 10) query_id.push_back('-');
+            query_id.push_back(hex[(b[j] >> 4) & 0xF]);
+            query_id.push_back(hex[b[j] & 0xF]);
+        }
+    }
+    if (query_id.empty()) { std::printf("  no notification; skipped\n"); return; }
+
+    auto killed = db.kill(query_id.c_str());
+    CHECK(killed.has_value());
+    if (!killed.has_value()) return;
+
+    // Drain anything already queued from before the kill.
+    for (int i = 0; i < 10; ++i) {
+        auto p = stream.try_next();
+        if (!p.has_value() || !p.value().ready()) break;
+        (void)p.value().take();
+    }
+
+    // Nothing written after a successful KILL may be delivered.
+    touch(db, "p13_kill:b");
+    touch(db, "p13_kill:c");
+
+    int delivered = 0;
+    bool ended = false;
+    for (int i = 0; i < 20; ++i) {
+        auto p = stream.next_for(50ms);
+        CHECK(p.has_value());
+        if (!p.has_value()) return;
+        if (p.value().ended()) { ended = true; break; }
+        if (p.value().timed_out()) continue;
+        ++delivered;
+        (void)p.value().take();
+    }
+
+    CHECK(delivered == 0);            // the kill took effect
+    CHECK(!ended);                    // ...but the stream is still open
+    CHECK(!stream.done());
+    CHECK(stream.failure() == nullptr);
+}
+
+// The end of a stream as the C actually reports it.
+//
+// This is the only reachable SR_CLOSED in the library: an `sr_stream_t` cannot
+// be ended from the database side at all, but an `rpc_stream` outlives the
+// context it came from and reports the end once that context is gone.
+//
+// Worth reaching, because 0.3.0 moved this code. `sr_stream_next` reported the
+// end as SR_NONE (0) in 0.2.x and reports it as SR_CLOSED (-1) now, so a reader
+// still written to the old contract reads a clean end as a failure while
+// compiling perfectly. `failure() == nullptr` and a non-error `result` are what
+// separate the two.
+void test_rpc_stream_ends_on_teardown() {
+    std::printf("timeout: rpc_stream ends when its context goes\n");
+
+    std::optional<sdb::rpc_stream> stream;
+    {
+        auto c = sdb::rpc::connect("memory");
+        if (!c.has_value()) { std::printf("  no rpc context; skipped\n"); return; }
+        auto ctx = std::move(c).value();
+        auto n = ctx.notifications();
+        if (!n.has_value()) { std::printf("  notifications unavailable; skipped\n"); return; }
+        stream.emplace(std::move(n).value());
+
+        auto alive = stream->try_next();
+        CHECK(alive.has_value());
+        if (alive.has_value()) CHECK(alive.value().timed_out());
+    }   // the context is destroyed here; the stream outlives it by design
+
+    auto p = stream->try_next();
+    CHECK(p.has_value());             // an end is not an error
+    if (!p.has_value()) return;
+    CHECK(p.value().ended());
+    CHECK(!p.value().timed_out());
+    CHECK(stream->done());
+
+    // The blocking reader agrees, and returns rather than parking.
+    auto b = stream->next();
+    CHECK(b.has_value());
+    CHECK(b.has_value() && b.value().empty());
+}
+
+// A negative duration must never reach the C.
+//
+// This assertion grew teeth in surrealdb.c 0.3.1. A negative `timeout_ms` used
+// to mean "wait forever"; it is now rejected outright with SR_ERROR, because
+// "forever" stopped being a thing this type offers. So an unclamped negative
+// went from hanging the caller to failing the call -- two different disasters
+// from one sloppy cast, and `to_timeout_ms` clamping to zero is what prevents
+// both.
+//
+// Checked against a live stream rather than only in the arithmetic, because the
+// arithmetic being right is worth nothing if the value takes a different route
+// to the C.
+void test_negative_duration_is_not_sent() {
+    std::printf("timeout: a negative bound never reaches C\n");
+    auto db = open();
+    if (!db.valid()) { std::printf("  no connection; skipped\n"); return; }
+
+    auto s = live_on(db, "p13_neg");
+    if (!s.has_value()) { std::printf("  live unavailable; skipped\n"); return; }
+    auto stream = std::move(s).value();
+
+    for (auto d : {std::chrono::milliseconds(-1),
+                   std::chrono::milliseconds(-1000)}) {
+        auto p = stream.next_for(d);
+        // Not an error: if the raw negative had been forwarded this would be
+        // SR_ERROR, and before 0.3.1 it would not have returned at all.
+        CHECK(p.has_value());
+        if (!p.has_value()) {
+            std::printf("  negative bound reached the C: %s\n",
+                        sdb::to_string(p.error().code()));
+            return;
+        }
+        CHECK(p.value().timed_out());
+        CHECK(!stream.done());
+    }
+
+    // Whole-second negatives too, where the conversion does more work.
+    auto p = stream.next_for(std::chrono::seconds(-5));
+    CHECK(p.has_value());
+    if (p.has_value()) CHECK(p.value().timed_out());
+
+    // And the clamp is genuinely a poll, not a wait: this must return at once.
+    const auto t0 = std::chrono::steady_clock::now();
+    (void)stream.next_for(std::chrono::hours(-1));
+    CHECK(std::chrono::steady_clock::now() - t0 < 1s);
+}
+
 void test_ended_is_not_timed_out() {
     std::printf("timeout: ended is not timed out\n");
     auto db = open();
@@ -387,11 +629,15 @@ int main() {
     test_timeout_conversion();
     test_poll_states();
     test_poll_take();
-    test_error_code_timeout();
+    test_status_codes();
     test_try_next_on_idle_stream();
     test_next_for_times_out();
     test_next_for_receives();
     test_timeout_then_event();
+    test_notification_query_id();
+    test_kill_stops_delivery();
+    test_rpc_stream_ends_on_teardown();
+    test_negative_duration_is_not_sent();
     test_ended_is_not_timed_out();
     test_rpc_stream_try_next();
     test_rpc_stream_closed_is_ended();

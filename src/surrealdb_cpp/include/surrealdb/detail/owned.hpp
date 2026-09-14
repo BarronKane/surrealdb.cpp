@@ -192,7 +192,7 @@ namespace policy {
 // Shape 1: pointer-owning.
 using value_ptr  = ptr_policy<sr_value_t,     ::sr_value_free>;
 using array      = ptr_policy<sr_array_t,     ::sr_array_free>;
-using rpc_stream = ptr_policy<sr_RpcStream,   ::sr_rpc_stream_free>;
+using rpc_stream = ptr_policy<sr_rpc_stream_t, ::sr_rpc_stream_free>;
 using stream     = ptr_policy<sr_stream_t,    ::sr_stream_kill>;
 using surreal    = ptr_policy<sr_surreal_t,   ::sr_surreal_disconnect>;
 using surreal_rpc = ptr_policy<sr_surreal_rpc_t, ::sr_surreal_rpc_disconnect>;

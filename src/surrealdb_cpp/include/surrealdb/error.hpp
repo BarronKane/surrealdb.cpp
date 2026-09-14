@@ -35,15 +35,18 @@ namespace surrealdb {
 /// operation on any thread returns `SR_FATAL` the handle must not be used
 /// again. `connection` latches this.
 enum class error_code : int {
+    /// Success for an ordinary call. On a stream's bounded reader it means
+    /// something else -- "nothing yet, the source is still open" -- which is
+    /// why those return `poll<T>` rather than a `result` whose `ok` would be
+    /// ambiguous. It never reaches an `error` from either path.
+    ///
+    /// surrealdb.c 0.3.0 gave this code that second job when it deleted
+    /// `SR_TIMEOUT`; `error_code::timeout` went with it.
     ok     = SR_NONE,    //  0
+    /// End of a stream, and the only negative code that is not a failure.
     closed = SR_CLOSED,  // -1
     error  = SR_ERROR,   // -2
     fatal  = SR_FATAL,   // -3
-    /// A bounded wait expired. Mirrored here so the enum stays a complete map
-    /// of the C status codes, but it is **not a failure** and never reaches an
-    /// `error`: the `_timeout` readers translate it into `poll_state::timed_out`
-    /// before it can be mistaken for one. See poll.hpp.
-    timeout = SR_TIMEOUT, // -4
 };
 
 [[nodiscard]] constexpr bool is_ok(error_code c) noexcept {
@@ -57,7 +60,6 @@ enum class error_code : int {
         case error_code::closed: return "closed";
         case error_code::error:  return "error";
         case error_code::fatal:  return "fatal";
-        case error_code::timeout: return "timeout";
     }
     return "unknown";
 }
