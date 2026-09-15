@@ -229,9 +229,9 @@ public:
         done_ = true;
         // SR_CLOSED is the ordinary end of a stream, not a failure -- it is
         // what a caller gets for shutting the context down on purpose.
-        // `SR_NONE` never comes back from a blocking read; folded in for the
+        // `SR_AGAIN` never comes back from a blocking read; folded in for the
         // same reason `stream::next` folds it in.
-        if (rc == SR_CLOSED || rc == SR_NONE) return owned_byte_array();
+        if (rc == SR_CLOSED || rc == SR_AGAIN) return owned_byte_array();
 
         return error(static_cast<error_code>(rc), owned_string());
     }
@@ -326,8 +326,8 @@ private:
         if (rc > 0) return poll<owned_byte_array>(owned_byte_array(out, rc));
 
         // Still live -- come back. Must not reach the `done_` below.
-        // `SR_NONE` as of 0.3.0; see the note in `stream::next_timeout_ms`.
-        if (rc == SR_NONE) return poll<owned_byte_array>(poll_state::timed_out);
+        // `SR_AGAIN` as of 0.3.0; see the note in `stream::next_timeout_ms`.
+        if (rc == SR_AGAIN) return poll<owned_byte_array>(poll_state::timed_out);
 
         done_ = true;
         // SR_CLOSED is the ordinary end here, as in `next()`: it is what
@@ -370,6 +370,11 @@ public:
     }
 
     [[nodiscard]] static result<rpc> connect(const char* endpoint, const options& opts) {
+        // Records that the process now has an engine, so a later
+        // `runtime_init()` can report that it is too late rather than
+        // succeeding and doing nothing.
+        detail::engine_started().store(true, std::memory_order_release);
+
         // The C view borrows from `view`, so it has to outlive the call.
         options::c_view view = opts.to_c();
         sr_surreal_rpc_t* raw = nullptr;

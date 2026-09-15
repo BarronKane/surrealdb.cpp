@@ -25,6 +25,7 @@ set(SURREALDB_CPP_TEST_SOURCES
     p11_geometry.cpp    # geometry and record-id views
     p12_standards.cpp   # feature gates vs the surface they claim
     p13_timeout.cpp     # bounded waits: poll<T>, next_for, try_next
+    p14_sessions.cpp    # forked sessions, runtime options, process-wide init
     compat_probe.cpp    # whole-surface breadth probe; also the compat-matrix probe
 )
 

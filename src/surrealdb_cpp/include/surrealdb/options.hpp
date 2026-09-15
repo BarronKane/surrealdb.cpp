@@ -11,9 +11,13 @@
 
 #include "config.hpp"
 #include "detail/c_api.hpp"
+#include "error.hpp"
+#include "poll.hpp"
 
 #include <cstdint>
 #include <initializer_list>
+#include <atomic>
+#include <chrono>
 #include <string>
 #include <utility>
 #include <vector>
@@ -126,6 +130,70 @@ public:
         return *this;
     }
 
+    // -- runtime shape ------------------------------------------------------
+    //
+    // These size the tokio runtime a context builds for itself. Every one
+    // defaults to zero, which means "surrealdb.c's default" rather than
+    // "nothing" -- a default-constructed `options` still changes nothing.
+
+    /// Worker threads for this context. Zero takes the library default
+    /// (`SR_DEFAULT_WORKER_THREADS`), which is deliberately *not* the core
+    /// count: an embedded database inside a host application has no business
+    /// claiming every core before a query runs.
+    options& worker_threads(int n) noexcept { worker_threads_ = n; return *this; }
+
+    /// Run the whole runtime on one thread. Not a count but a mode -- the
+    /// scheduler itself becomes single-threaded, which is the genuinely slim
+    /// option for intermittent work. Overrides `worker_threads`.
+    options& current_thread(bool on) noexcept { current_thread_ = on; return *this; }
+
+    /// Ceiling on lazily-spawned blocking threads. Zero means tokio's 512.
+    /// A cap, not residency: they spawn on demand and retire after
+    /// `thread_keep_alive`.
+    options& max_blocking_threads(int n) noexcept {
+        max_blocking_threads_ = n; return *this;
+    }
+
+    /// How long an idle blocking thread lingers. Zero means tokio's 10s.
+    /// Lower means less sawtooth after a burst.
+    template <class Rep, class Period>
+    options& thread_keep_alive(std::chrono::duration<Rep, Period> d) noexcept {
+        thread_keep_alive_ms_ = detail::to_timeout_ms(d);
+        return *this;
+    }
+
+    /// Stack size per worker thread, in bytes. Zero means the platform
+    /// default, which on Linux reserves 8 MiB of address space per thread.
+    options& thread_stack_size(int bytes) noexcept {
+        thread_stack_size_ = bytes; return *this;
+    }
+
+    /// Skip the IO driver. Free for an embedded-only context, but it is what
+    /// `http://` and `ws://` endpoints -- and SurrealQL's `http::*` functions
+    /// -- are built on, so a context that reaches the network must leave this
+    /// alone. Off by default for that reason.
+    options& disable_io(bool on) noexcept { disable_io_ = on; return *this; }
+
+    /// Directory for temporary files. Empty means the platform default, which
+    /// is not always right, or writable at all, on console and mobile targets.
+    options& temporary_directory(std::string dir) {
+        temporary_directory_ = std::move(dir); return *this;
+    }
+
+    /// Log queries slower than this. Zero disables it. Ignored by `rpc`, which
+    /// does not build the datastore directly.
+    ///
+    /// **Slow-query logs include bound parameters**, and parameters are how
+    /// credentials travel -- a `signin` carries its password as one. The log
+    /// goes wherever the host's `tracing` subscriber points, which on a client
+    /// machine may be a file that outlives the process. Enabling this is a
+    /// decision about credential handling, not about verbosity.
+    template <class Rep, class Period>
+    options& slow_log(std::chrono::duration<Rep, Period> d) noexcept {
+        slow_log_ms_ = detail::to_timeout_ms(d);
+        return *this;
+    }
+
     [[nodiscard]] surrealdb::capabilities& capabilities() noexcept { return caps_; }
     [[nodiscard]] const surrealdb::capabilities& capabilities() const noexcept { return caps_; }
 
@@ -140,6 +208,7 @@ public:
         // Stable backing for every `const char*` handed to C.
         std::vector<std::vector<const char*>> ptr_lists;
         std::string session_dir;
+        std::string temporary_directory;
     };
 
     [[nodiscard]] c_view to_c() const {
@@ -149,6 +218,18 @@ public:
 
         v.session_dir = session_dir_;
         v.opts.session_dir = v.session_dir.empty() ? nullptr : v.session_dir.c_str();
+
+        v.temporary_directory = temporary_directory_;
+        v.opts.temporary_directory =
+            v.temporary_directory.empty() ? nullptr : v.temporary_directory.c_str();
+
+        v.opts.worker_threads = worker_threads_;
+        v.opts.current_thread = current_thread_;
+        v.opts.max_blocking_threads = max_blocking_threads_;
+        v.opts.thread_keep_alive_ms = thread_keep_alive_ms_;
+        v.opts.thread_stack_size = thread_stack_size_;
+        v.opts.disable_io = disable_io_;
+        v.opts.slow_log_ms = slow_log_ms_;
 
         v.opts.capabilities.scripting = static_cast<sr_toggle_t>(caps_.scripting);
         v.opts.capabilities.guest_access = static_cast<sr_toggle_t>(caps_.guest_access);
@@ -194,7 +275,107 @@ private:
     std::uint8_t query_timeout_{0};
     std::uint8_t transaction_timeout_{0};
     std::string session_dir_;
+    std::string temporary_directory_;
+    int worker_threads_{0};
+    int max_blocking_threads_{0};
+    int thread_keep_alive_ms_{0};
+    int thread_stack_size_{0};
+    int slow_log_ms_{0};
+    bool current_thread_{false};
+    bool disable_io_{false};
     surrealdb::capabilities caps_;
 };
+
+// ---------------------------------------------------------------------------
+// Process-wide settings
+// ---------------------------------------------------------------------------
+
+namespace detail {
+
+/// Set the first time any context is opened.
+///
+/// A function-local static so this stays header-only and single-instance. It
+/// exists only so `runtime_init` can report the one mistake the C cannot.
+inline std::atomic<bool>& engine_started() noexcept {
+    static std::atomic<bool> started{false};
+    return started;
+}
+
+} // namespace detail
+
+/// Settings that belong to the process, not to a context.
+///
+/// Separate from `options` because the lifetime is different, and the C draws
+/// the same line for the same reason: a per-context field carrying a
+/// process-global setting is a trap, because the second context's value is
+/// silently ignored and nothing at the call site says so.
+class runtime_options {
+public:
+    runtime_options() = default;
+
+    /// Size of SurrealDB's shared blocking pool. Zero leaves it alone.
+    ///
+    /// Worth setting on a host application even at the default value's own
+    /// size. Upstream spends one worker per core on machines with 16 or more
+    /// cores and 16 below that -- so a 32-core machine spends 32 threads here
+    /// before a single query runs -- and, worse, it *pins* one worker per core
+    /// when the size equals the core count and that count is at least 16, which
+    /// fights any engine managing its own affinity. Any value that differs from
+    /// the core count drops the pinning.
+    ///
+    /// SurrealDB clamps it to a minimum of 4.
+    runtime_options& kvs_threadpool_size(int n) noexcept {
+        kvs_threadpool_size_ = n;
+        return *this;
+    }
+
+    [[nodiscard]] sr_runtime_options_t to_c() const noexcept {
+        sr_runtime_options_t o{};
+        o.kvs_threadpool_size = kvs_threadpool_size_;
+        return o;
+    }
+
+private:
+    int kvs_threadpool_size_{0};
+};
+
+/// Apply process-wide settings. Call once, before opening anything.
+///
+/// `true` means the settings were applied; `false` means there was nothing to
+/// do, which is what a default-constructed `runtime_options` produces.
+///
+/// **This is not idempotent and cannot be.** SurrealDB builds its blocking pool
+/// once per process, on first use, from an environment variable read behind a
+/// `LazyLock`. So this has to run before the first `connection::connect` or
+/// `rpc::connect`. Afterwards it does nothing -- and the C, having no way to
+/// know the pool was already built, cannot tell you that it did nothing.
+///
+/// This wrapper can, for the in-process case: it remembers whether a context
+/// has been opened and fails rather than succeeding silently. That does not
+/// cover a pool built by something else in the same process, so a `true` here
+/// is still "the variable was set", not "the pool is now this size". Call it
+/// first and the distinction never comes up.
+[[nodiscard]] inline result<bool> runtime_init(const runtime_options& opts) noexcept {
+    if (detail::engine_started().load(std::memory_order_acquire)) {
+        return error::local(error_code::error,
+                            "runtime_init() after a context was already opened: "
+                            "SurrealDB builds its blocking pool once, on first "
+                            "use, so this would have been silently ignored. Call "
+                            "it before the first connect().");
+    }
+
+    const sr_runtime_options_t c = opts.to_c();
+    sr_string_t err = nullptr;
+    const int rc = ::sr_runtime_init(&err, &c);
+    if (rc < 0) return error::adopt(rc, err);
+    if (err != nullptr) ::sr_string_free(err);
+    return rc > 0;
+}
+
+/// Apply nothing, and only record that the process is past the point where
+/// applying would work. Rarely wanted; present so the no-op case is spellable.
+[[nodiscard]] inline result<bool> runtime_init() noexcept {
+    return runtime_init(runtime_options{});
+}
 
 } // namespace surrealdb

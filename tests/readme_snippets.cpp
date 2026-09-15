@@ -191,7 +191,34 @@ int main() {
                 handle(n->action(), n->data());
             }
             (void)stream_.try_next();
+            (void)stream_.query_id();
+
+            // Retires the subscription and releases the reader, in one call.
+            stream_.close();
         }
+    }
+
+    // -- Sessions --
+    {
+        auto player = db.new_session().value();
+        (void)player.use("game", "shard_04");
+        (void)player.fork_session();
+    }
+
+    // -- Sizing the runtime --
+    {
+        options slim;
+        slim.current_thread(true)
+            .max_blocking_threads(8)
+            .thread_keep_alive(std::chrono::seconds(2))
+            .disable_io(true);
+        (void)slim.to_c();
+
+        runtime_options ro;
+        ro.kvs_threadpool_size(8);
+        // Not actually applied here: this file opens a connection above, and
+        // runtime_init is documented as a before-anything call.
+        (void)ro.to_c();
     }
 
     // -- RPC and sessions --

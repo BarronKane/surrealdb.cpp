@@ -43,6 +43,15 @@ using ::surrealdb::to_string;
 using ::surrealdb::poll;
 using ::surrealdb::poll_state;
 
+// What the C dependency supports, as constants rather than macros.
+using ::surrealdb::has_unbounded_stream_read;
+using ::surrealdb::c_version;
+using ::surrealdb::required_c_version;
+
+// Process-wide settings
+using ::surrealdb::runtime_options;
+using ::surrealdb::runtime_init;
+
 // Ownership
 using ::surrealdb::owned_array;
 using ::surrealdb::owned_arr_results;

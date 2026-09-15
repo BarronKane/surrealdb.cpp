@@ -35,14 +35,17 @@ namespace surrealdb {
 /// operation on any thread returns `SR_FATAL` the handle must not be used
 /// again. `connection` latches this.
 enum class error_code : int {
-    /// Success for an ordinary call. On a stream's bounded reader it means
-    /// something else -- "nothing yet, the source is still open" -- which is
-    /// why those return `poll<T>` rather than a `result` whose `ok` would be
-    /// ambiguous. It never reaches an `error` from either path.
+    /// Zero. Success for an ordinary call, and "nothing yet, the source is
+    /// still open" for a stream's bounded reader -- which is why those return
+    /// `poll<T>` rather than a `result` whose `ok` would be ambiguous. It never
+    /// reaches an `error` from either path.
     ///
-    /// surrealdb.c 0.3.0 gave this code that second job when it deleted
-    /// `SR_TIMEOUT`; `error_code::timeout` went with it.
-    ok     = SR_NONE,    //  0
+    /// The C spelled this `SR_NONE` until 0.3.2 and spells it `SR_AGAIN` now,
+    /// which is the better name for the job it picked up in 0.3.0 when
+    /// `SR_TIMEOUT` was deleted. The value never moved; only the name did, and
+    /// `error_code::ok` keeps its own name because for a `result` that is what
+    /// zero means.
+    ok     = SR_AGAIN,    //  0
     /// End of a stream, and the only negative code that is not a failure.
     closed = SR_CLOSED,  // -1
     error  = SR_ERROR,   // -2

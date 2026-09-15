@@ -225,7 +225,21 @@ void probe_connection() {
     expect(live.has_value(), "live");
     if (live) {
         sdb::stream s = std::move(live).value();
-        // Bounded waits, through whichever spelling this probe is testing.
+        // A forked session: same engine, its own state.
+    {
+        auto forked = db.fork_session();
+        expect(forked.has_value(), "fork_session");
+        if (forked) {
+            auto f = std::move(forked).value();
+            expect(f.valid(), "fork valid");
+            expect(f.poisoned() == db.poisoned(), "fork shares poisoning");
+            expect(f.query("RETURN 1").has_value(), "fork query");
+        }
+        auto fresh = db.new_session();
+        expect(fresh.has_value(), "new_session");
+    }
+
+    // Bounded waits, through whichever spelling this probe is testing.
         // `try_next` cannot block, so it is safe here where a blocking read
         // would hang a probe that has produced no events.
         auto p = s.try_next();
@@ -269,6 +283,15 @@ void probe_rpc() {
         0x66,'p','a','r','a','m','s', 0x81, 0x68,'R','E','T','U','R','N',' ','1',
     };
     expect(ctx.execute(req).has_value(), "rpc query");
+
+    // Forked sessions and the runtime knobs -- 0.3.2.
+    {
+        sdb::runtime_options ro;
+        ro.kvs_threadpool_size(0);          // a no-op value, so ordering is moot
+        (void)ro.to_c();
+        expect(sdb::c_version >= sdb::required_c_version, "c version floor");
+        expect(!sdb::has_unbounded_stream_read, "unbounded read withheld");
+    }
 
     // Typed queries on a session -- 0.3.0's sr_rpc_query_on.
     {

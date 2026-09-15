@@ -8,7 +8,7 @@
 ///
 /// Including the C header in consumer translation units is deliberate and
 /// harmless: it declares functions and types and defines exactly ten macros,
-/// every one `SR_`-prefixed (`SR_NONE`, `SR_CLOSED`, `SR_ERROR`, `SR_FATAL`,
+/// every one `SR_`-prefixed (`SR_AGAIN`, `SR_CLOSED`, `SR_ERROR`, `SR_FATAL`,
 /// `SR_VERSION_*`). There is no collision surface, which is why this library is
 /// header-only rather than hiding the C API behind a compiled boundary -- a
 /// boundary would buy nothing and would cost cross-translation-unit inlining,
@@ -54,33 +54,75 @@ extern "C" {
 // ---------------------------------------------------------------------------
 //
 // This library calls functions that do not exist in every release -- 0.2.0
-// needs `sr_rpc_query_on`, added in surrealdb.c 0.3.0 -- and building against
-// an older header does not fail anywhere useful.
+// needs `sr_session_fork` and `sr_runtime_init`, added in surrealdb.c 0.3.2 --
+// and building against an older header does not fail anywhere useful. It fails
+// as an undeclared identifier partway down a header the user did not write, or,
+// if the declaration happens to exist but the symbol does not, at the link with
+// a mangled name and no hint about which half is stale.
 //
 // The floor matters more than usual across 0.3.x, because those releases
-// *reassigned* and *withdrew* rather than only adding. `SR_NONE` meant "stream
-// ended" in 0.2.x and means "nothing yet, still open" from 0.3.0; a negative
-// `timeout_ms` meant "wait forever" and is an error from 0.3.1; and
-// `sr_stream_next` is gone entirely. Against a 0.2.x header the renamed types
-// fail to compile, which is a mercy -- the alternative is a build that succeeds
-// and then reads every quiet moment as a dead stream. It fails as an undeclared identifier partway down
-// stream.hpp, or, if the declaration happens to exist but the symbol does not,
-// at the link with a mangled name and no hint about which half is stale.
+// *reassigned*, *withdrew* and *renamed* rather than only adding. Zero meant
+// "stream ended" in 0.2.x and means "nothing yet, still open" from 0.3.0; it
+// was spelled `SR_NONE` until 0.3.2 and is `SR_AGAIN` now; a negative
+// `timeout_ms` meant "wait forever", became an error in 0.3.1, and means
+// "forever" again in 0.3.2. Only the rename fails to compile. The rest are live
+// semantic changes behind a stable spelling, which is why the readers here work
+// from the sign and why this floor is asserted rather than assumed.
 //
-// One assertion at the point the C API enters turns that into a sentence. The
-// floor is checked, not the exact version: surrealdb.c is additive within a
-// minor, so newer is fine and only older is a problem.
+// One assertion at the point the C API enters turns a stale dependency into a
+// sentence. The floor is checked, not the exact version: surrealdb.c is
+// additive within a patch, so newer is fine and only older is a problem.
 #define SURREALDB_CPP_REQUIRES_C_MAJOR 0
 #define SURREALDB_CPP_REQUIRES_C_MINOR 3
-#define SURREALDB_CPP_REQUIRES_C_PATCH 1
+#define SURREALDB_CPP_REQUIRES_C_PATCH 2
 
 #if !defined(SR_VERSION)
-#  error "surrealdb.h defines no SR_VERSION. surrealdb.cpp needs surrealdb.c v0.3.1 or newer."
+#  error "surrealdb.h defines no SR_VERSION. surrealdb.cpp needs surrealdb.c v0.3.2 or newer."
 #endif
 
 static_assert(SR_VERSION >= SR_VERSION_ENCODE(SURREALDB_CPP_REQUIRES_C_MAJOR,
                                               SURREALDB_CPP_REQUIRES_C_MINOR,
                                               SURREALDB_CPP_REQUIRES_C_PATCH),
-              "surrealdb.cpp requires surrealdb.c v0.3.1 or newer "
+              "surrealdb.cpp requires surrealdb.c v0.3.2 or newer "
               "(SR_VERSION_STRING reports what was actually found). Update the "
               "surrealdb.c submodule, or point SURREALDB_C_ROOT at a newer one.");
+
+// ---------------------------------------------------------------------------
+// Capabilities of the C, as opposed to capabilities of the standard
+// ---------------------------------------------------------------------------
+//
+// config.hpp owns the `SURREALDB_HAS_*` gates that describe the *language*.
+// This one describes the *dependency*, so it lives here where `SR_VERSION` is
+// visible.
+//
+// `sr_stream_next` blocks with no bound. Against SurrealDB 3.2.4 a killed live
+// query never reports its end, so a reader parked in it cannot be released by
+// anything short of ending the process -- surrealdb.c restored the symbol in
+// 0.3.2 while advising against it, and this library refuses to compile the call
+// at all. `stream::next()` and stream iteration are `= delete`d on this.
+//
+// Pinned to a version rather than probed, because there is nothing to probe:
+// the defect is in the Rust dependency surrealdb.c pins, not in any symbol or
+// macro the C header exposes. Move it when surrealdb.c bumps past
+// surrealdb/surrealdb#7520, and the deleted members come back with it.
+#define SURREALDB_HAS_UNBOUNDED_STREAM_READ 0
+
+namespace surrealdb {
+
+/// Whether `stream::next()` exists. False while the upstream live-query fix is
+/// outstanding; see the note above. `rpc_stream::next()` is unaffected and is
+/// always available -- that path reads the datastore's broker channel directly
+/// and never passes through the gate that drops the terminal notification.
+inline constexpr bool has_unbounded_stream_read =
+    SURREALDB_HAS_UNBOUNDED_STREAM_READ != 0;
+
+/// The minimum surrealdb.c this library was built to call.
+inline constexpr int required_c_version =
+    SR_VERSION_ENCODE(SURREALDB_CPP_REQUIRES_C_MAJOR,
+                      SURREALDB_CPP_REQUIRES_C_MINOR,
+                      SURREALDB_CPP_REQUIRES_C_PATCH);
+
+/// The surrealdb.c actually being compiled against, same encoding.
+inline constexpr int c_version = SR_VERSION;
+
+} // namespace surrealdb

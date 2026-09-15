@@ -203,13 +203,17 @@ stream.close();
 
 Three things about this API are worth knowing before you use it:
 
-- **Every read is bounded, and that is not a convenience.** surrealdb.c 0.3.1
-  withdrew the unbounded `next()` entirely, because a reader parked in it had no
-  exit — see [Ending a live query](#ending-a-live-query). `next()` and range-for
-  are `= delete`d here with that reason attached, rather than merely absent, so
-  code written against the old shape is told what to do. A long bound is cheap:
-  the wait is a real timer, so `next_for(std::chrono::hours(1))` costs what
-  blocking for an hour would have cost and still returns.
+- **Every read is bounded, and that is a choice this library is still making.**
+  A reader parked in an unbounded read has no exit — see [Ending a live
+  query](#ending-a-live-query). surrealdb.c withdrew `sr_stream_next` in 0.3.1
+  and restored it in 0.3.2 ahead of the upstream fix, documenting it as the
+  wrong call to reach for meanwhile. This library keeps it `= delete`d, because
+  the symbol came back and the deadlock did not go away, and a compile error
+  that explains itself beats a hung thread. `surrealdb::has_unbounded_stream_read`
+  is the flag to watch; `next()` and range-for return when it flips. A long
+  bound is cheap: the wait is a real timer, so
+  `next_for(std::chrono::hours(1))` costs what blocking for an hour would have
+  cost and still returns.
 - **A live stream is not a range.** An iterator has two answers — here is an
   element, or the range is over — and a bounded read has three. The third,
   "nothing yet", has nowhere to go: advancing on it parks forever, ending on it
@@ -263,21 +267,54 @@ runtime that may already be shut down. Prefer tens of milliseconds over one.
 
 ### Ending a live query
 
-**Use `stream::close()`.** It stops the underlying live query and releases the
-stream in one step.
+```cpp
+stream.close();     // retires the subscription and releases the reader
+```
 
-`connection::kill()` does *not* — and this is the sharp edge. It stops delivery,
-but the stream stays open forever: it goes quiet and never reports its end.
-Nothing on the database side ends one, not `KILL`, `REMOVE TABLE`,
-`REMOVE DATABASE` or `REMOVE NAMESPACE`. That is an upstream core defect rather
-than anything either library can work around, and it is the reason the unbounded
-read no longer exists: a reader parked on a killed live query had no way out at
-all. Nothing arrives, the end never comes, and killing the stream from another
-thread frees the very object that reader is borrowing.
+That is the whole thing, and the destructor calls it, so scope exit is already
+correct.
 
-So reach for `kill()` only for a live query registered some other way — a bare
-`LIVE SELECT` run through `query()` — where there is no stream to strand. An
-`rpc_stream` does report its end, when the context it came from is destroyed.
+It is worth knowing what that one call is covering for. The C needs **two**:
+`sr_kill` retires the subscription in the datastore, `sr_stream_kill` frees the
+local reader, and neither does the other's job. `sr_stream_kill` does route a
+kill through the SDK, but it is `tokio::spawn`ed with its result discarded and
+observably does not land on SurrealDB 3.2.4 — `INFO FOR TABLE` carries a `lives`
+object, and the count is undiminished afterwards. Two calls that must both
+happen is a rule rather than a type, so `close()` does both and is the only way
+to close a stream.
+
+`connection::kill()` is still there for a live query registered *without* a
+stream — a bare `LIVE SELECT` run through `query()`, which answers with the id
+but hands back no reader. Using it on a stream you hold is now redundant rather
+than wrong.
+
+**One hole cannot be closed from here.** `db.live()` returns a stream and not an
+id, and the SDK keeps its own copy private, so the id is only learnable from the
+first notification — `stream::query_id()` is empty until then. A live query that
+never fires has no id anyone can name, so it cannot be retired; it goes when the
+connection does. The alternative is running `LIVE SELECT` through `query()` to
+get the id, but then there is no stream to read from. Picking one is a real
+limitation of the C API, not a style choice.
+
+### Killing does not end a stream
+
+`kill()` stops delivery but leaves the stream open and silent. Nothing on the
+database side ends one — not `KILL`, not `REMOVE TABLE`, `REMOVE DATABASE` or
+`REMOVE NAMESPACE`.
+
+That is an upstream core defect, and a precise one:
+[surrealdb/surrealdb#7520](https://github.com/surrealdb/surrealdb/pull/7520).
+`KILL` and `REMOVE TABLE` build their terminal notification with the session id
+unset, and the embedded router drops exactly that shape before routing it —
+everything below the gate already works. `REMOVE TABLE` is the worse half,
+because no caller asked for it: an unrelated schema change orphans every stream
+on that table, so "only block when an event is coming" is not a discipline
+anyone can keep. It is also why the unbounded read is withheld here: a reader
+parked on a killed live query has no way out at all. Nothing arrives, the end
+never comes, and killing the stream from another thread frees the very object
+that reader is borrowing.
+
+An `rpc_stream` does report its end, when the context it came from is destroyed.
 
 Sessions are the exception, and they are tidier about it. On an `rpc` context,
 `detach()` and `reset()` both retire the session's live queries — so do the
@@ -436,6 +473,43 @@ that **SurrealDB is not RFC 6902 here**: a missing path is not an error.
 behind, and removing a path that is not there is a silent no-op. If you need
 strict behaviour, read the record first — these calls will not tell you.
 
+## Sessions
+
+One embedded database, several independent users — players, tenants, requests.
+Needs **surrealdb.c 0.3.2**.
+
+```cpp
+auto player = db.new_session().value();     // own auth, inherits ns/db
+player.use("game", "shard_04");
+player.signin(creds);
+```
+
+A fork talks to the same engine over the same runtime and carries its own
+session state: its own `USE` namespace and database, its own session variables,
+its own authentication. It is **not** a second connection — no engine starts, no
+runtime is built, no threads are added.
+
+- `fork_session()` inherits everything, including authentication.
+- `new_session()` clears the authentication. Reach for this one whenever the new
+  session belongs to a different principal, since inheriting a parent's
+  credentials is the exact leak sessions exist to prevent. Namespace and
+  database are still inherited, deliberately — clearing those would hand back a
+  handle that cannot run anything until you pick them again, and `use()` is
+  right there.
+
+Either handle may be destroyed first; the engine goes away with the last one.
+A `stream` opened on a fork stays valid after that fork is gone, because the
+runtime it borrows is reference-counted and outlives any single handle.
+
+**Poisoning is shared.** `SR_FATAL` means the engine itself is gone, so every
+handle derived from it reports poisoned too — a sibling still claiming health
+while talking to a dead engine would be worse than the failure.
+
+One thing that catches people, and caught me: **`LET` inside a query is scoped
+to that query.** `LET $x = 1` followed by a separate `RETURN $x` reads `none`,
+while `LET $x = 1; RETURN $x` in one call reads 1. `set()` is the session
+variable, and the session is what a fork forks.
+
 ## RPC and sessions
 
 `connection` speaks typed verbs. An `rpc` context speaks the wire protocol,
@@ -558,6 +632,60 @@ is), which is enough on a server — the case it was built for. It is not disk
 encryption. Keep it off shared or synced volumes, and think hard before enabling
 it on hardware the end user controls, where "the current user" and "the
 attacker" are the same account. Left unset, nothing is written.
+
+### Sizing the runtime
+
+**surrealdb.c 0.3.2.** A context builds its own tokio runtime, and the defaults
+are sized for a server rather than for a database embedded inside something
+else:
+
+```cpp
+sdb::options slim;
+slim.current_thread(true)          // one thread for the whole scheduler
+    .max_blocking_threads(8)
+    .thread_keep_alive(std::chrono::seconds(2))
+    .disable_io(true);             // only if nothing reaches the network
+```
+
+`current_thread` is a mode rather than a count, and it is the genuinely slim
+option for intermittent work. `disable_io` is free for an embedded-only context
+but it is what `http://` and `ws://` endpoints — and SurrealQL's `http::*`
+functions — are built on, so a context that reaches the network must leave it
+alone. Zero everywhere means "the library default", so a default-constructed
+`options` still changes nothing.
+
+`slow_log` is the other one to read before setting: **slow-query logs include
+bound parameters**, and parameters are how credentials travel — a `signin`
+carries its password as one. The log goes wherever the host's `tracing`
+subscriber points. Enabling it is a decision about credential handling, not
+about verbosity.
+
+### Process-wide settings
+
+One setting belongs to the process rather than to a context, and must be applied
+before anything opens:
+
+```cpp
+sdb::runtime_options ro;
+ro.kvs_threadpool_size(8);
+if (auto r = sdb::runtime_init(ro); !r) { /* r.error().message() */ }
+
+auto db = sdb::connection::connect("mem://").value();   // after, always
+```
+
+Worth setting even at the default's own size. SurrealDB spends one worker per
+core on machines with 16 or more cores and 16 below that — so a 32-core machine
+spends 32 threads before a single query runs — and it *pins* one worker per core
+when the size equals the core count and that count is at least 16, which fights
+any engine managing its own affinity. Any value that differs from the core count
+drops the pinning.
+
+**It is not idempotent and cannot be.** The pool is built once per process, on
+first use, from an environment variable read behind a lock, so a call after the
+first connection does nothing — and the C, not knowing the pool already exists,
+cannot tell you that it did nothing. This wrapper can for the in-process case:
+it remembers whether a context has been opened and returns an error rather than
+succeeding silently. Call it first and the distinction never arises.
 
 ## Building
 
@@ -717,7 +845,7 @@ rather than through a generator.
   build here pins a newer CMake for its Ninja C23/C++23 codegen fixes.
 - A **C++17** compiler. That is the floor, not the target: see
   [Standards](#standards).
-- [surrealdb.c](https://github.com/surrealdb/surrealdb.c) **v0.3.0 or newer** —
+- [surrealdb.c](https://github.com/surrealdb/surrealdb.c) **v0.3.2 or newer** —
   found automatically, or cloned if missing. The floor is asserted twice: at
   configure time when the header can be located, and by a `static_assert` in
   `detail/c_api.hpp` that fires wherever the headers come from. Building against

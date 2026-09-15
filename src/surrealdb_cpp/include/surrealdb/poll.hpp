@@ -17,7 +17,7 @@
 /// cannot say which it was -- would undo that at the boundary.
 ///
 /// The C spells the distinction on the **sign** as of 0.3.0: `> 0` is a value,
-/// `== 0` (`SR_NONE`) is "not yet, still open", and `< 0` is "stop", with
+/// `== 0` (`SR_AGAIN`) is "not yet, still open", and `< 0` is "stop", with
 /// `SR_CLOSED` the clean end and anything else a failure. Before that it was a
 /// dedicated `SR_TIMEOUT` code, and the end of a stream had two different
 /// encodings depending on which call you held. The three states here did not

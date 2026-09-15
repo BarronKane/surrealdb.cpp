@@ -233,8 +233,7 @@ find_package(surrealdb_c REQUIRED)
 
 # --- minimum surrealdb.c -----------------------------------------------------
 #
-# 0.2.0 calls `sr_rpc_query_on` (surrealdb.c 0.3.0) and relies on the bounded
-# stream reads that 0.3.1 made the only ones.
+# 0.2.0 calls `sr_session_fork` and `sr_runtime_init`, which arrived in 0.3.2.
 # `detail/c_api.hpp` static_asserts this and is the real backstop -- it fires
 # wherever the headers come from, including an installed package this module
 # never looked inside. Checking here as well only buys an earlier and more

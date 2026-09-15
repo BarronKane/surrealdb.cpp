@@ -153,7 +153,7 @@ void test_poll_take() {
 
 // The status codes, and the sign contract the readers are written against.
 //
-// surrealdb.c 0.3.0 deleted SR_TIMEOUT and gave SR_NONE its job, so a timeout
+// surrealdb.c 0.3.0 deleted SR_TIMEOUT and gave SR_AGAIN its job, so a timeout
 // now shares an encoding with an ordinary success. That is safe only because
 // the bounded readers translate it into `poll_state::timed_out` before it can
 // reach a `result` -- these checks pin the encoding those readers depend on.
@@ -166,7 +166,7 @@ void test_status_codes() {
     CHECK(static_cast<int>(sdb::error_code::error) == -2);
     CHECK(static_cast<int>(sdb::error_code::fatal) == -3);
 
-    CHECK(static_cast<int>(sdb::error_code::ok) == SR_NONE);
+    CHECK(static_cast<int>(sdb::error_code::ok) == SR_AGAIN);
     CHECK(static_cast<int>(sdb::error_code::closed) == SR_CLOSED);
 
     // The sign contract: > 0 a value, == 0 not yet, < 0 stop. `closed` is the
@@ -359,6 +359,183 @@ void test_notification_query_id() {
     }
 }
 
+
+// How many live queries the datastore still holds for a table.
+//
+// `INFO FOR TABLE` carries a `lives` object, and it is the only window onto
+// whether a live query was actually retired -- the client side cannot tell.
+// Returns -1 when the shape is not what is expected, so a change upstream
+// shows up as a failing test rather than a silently passing one.
+int live_count(sdb::connection& db, const char* table) {
+    char stmt[128];
+    std::snprintf(stmt, sizeof(stmt), "INFO FOR TABLE %s", table);
+    auto r = db.query(stmt);
+    if (!r) return -1;
+    auto rows = r.value().single();
+    if (!rows || rows.value().size() != 1) return -1;
+    auto o = sdb::value(rows.value()[0]).as_object();
+    if (!o) return -1;
+    auto lv = o->get("lives");
+    if (!lv) return -1;
+    auto lo = lv->as_object();
+    return lo ? lo->size() : -1;
+}
+
+// Pulls one notification just to learn the live query's id.
+std::string query_id_of(sdb::stream& s) {
+    for (int i = 0; i < 60; ++i) {
+        auto p = s.next_for(50ms);
+        if (!p.has_value() || p.value().ended()) return {};
+        if (p.value().timed_out()) continue;
+        auto n = p.value().take();
+        if (!n.has_value()) return {};
+        static const char* hex = "0123456789abcdef";
+        const std::uint8_t* b = n.value().query_id().bytes;
+        std::string o;
+        for (int j = 0; j < 16; ++j) {
+            if (j == 4 || j == 6 || j == 8 || j == 10) o.push_back('-');
+            o.push_back(hex[(b[j] >> 4) & 0xF]);
+            o.push_back(hex[b[j] & 0xF]);
+        }
+        return o;
+    }
+    return {};
+}
+
+// close() retires the subscription as well as releasing the reader.
+//
+// The C needs two calls -- `sr_kill` retires the subscription, `sr_stream_kill`
+// frees the reader, and neither does the other's job. Two calls that must both
+// happen is a rule, not a type, so `close()` does both and is the only way to
+// close a stream. That makes the half-teardown unrepresentable rather than
+// merely documented.
+//
+// `INFO FOR TABLE`'s `lives` is the only window onto the datastore half; the
+// client cannot otherwise tell.
+void test_close_retires_the_query() {
+    std::printf("timeout: close() retires the subscription\n");
+    auto db = open();
+    if (!db.valid()) { std::printf("  no connection; skipped\n"); return; }
+    (void)db.query("DEFINE TABLE p13_lives SCHEMALESS");
+    if (live_count(db, "p13_lives") < 0) { std::printf("  no lives; skipped\n"); return; }
+    CHECK(live_count(db, "p13_lives") == 0);
+
+    {
+        auto s = live_on(db, "p13_lives");
+        if (!s.has_value()) { std::printf("  live unavailable; skipped\n"); return; }
+        auto stream = std::move(s).value();
+        touch(db, "p13_lives:a");
+
+        // The id only exists once a notification has been read.
+        CHECK(!stream.query_id().has_value());
+        CHECK(!query_id_of(stream).empty());
+        CHECK(stream.query_id().has_value());
+
+        CHECK(live_count(db, "p13_lives") == 1);
+        stream.close();
+    }
+
+    int after = live_count(db, "p13_lives");
+    for (int i = 0; i < 20 && after != 0; ++i) {
+        (void)db.query("RETURN 1");
+        after = live_count(db, "p13_lives");
+    }
+    CHECK(after == 0);
+}
+
+// Scope exit does the same thing, because the destructor calls close().
+void test_destructor_retires_the_query() {
+    std::printf("timeout: scope exit retires it too\n");
+    auto db = open();
+    if (!db.valid()) { std::printf("  no connection; skipped\n"); return; }
+    (void)db.query("DEFINE TABLE p13_scope SCHEMALESS");
+    if (live_count(db, "p13_scope") < 0) { std::printf("  no lives; skipped\n"); return; }
+
+    {
+        auto s = live_on(db, "p13_scope");
+        if (!s.has_value()) { std::printf("  live unavailable; skipped\n"); return; }
+        auto stream = std::move(s).value();
+        touch(db, "p13_scope:a");
+        CHECK(!query_id_of(stream).empty());
+        CHECK(live_count(db, "p13_scope") == 1);
+    }   // no close() call anywhere
+
+    int after = live_count(db, "p13_scope");
+    for (int i = 0; i < 20 && after != 0; ++i) {
+        (void)db.query("RETURN 1");
+        after = live_count(db, "p13_scope");
+    }
+    CHECK(after == 0);
+}
+
+// The hole that cannot be closed from here.
+//
+// `sr_select_live` returns a stream and not an id, and the SDK keeps its copy
+// private, so a live query that has never fired has no id anyone can name --
+// there is nothing to pass to `sr_kill`. It goes when the connection does.
+//
+// Pinned so the limitation is visible rather than folklore, and so that a C API
+// that later hands back the id at creation shows up here as a failure.
+void test_unread_stream_cannot_be_retired() {
+    std::printf("timeout: an unread stream cannot be retired\n");
+    auto db = open();
+    if (!db.valid()) { std::printf("  no connection; skipped\n"); return; }
+    (void)db.query("DEFINE TABLE p13_unread SCHEMALESS");
+    if (live_count(db, "p13_unread") < 0) { std::printf("  no lives; skipped\n"); return; }
+
+    {
+        auto s = live_on(db, "p13_unread");
+        if (!s.has_value()) { std::printf("  live unavailable; skipped\n"); return; }
+        auto stream = std::move(s).value();
+        CHECK(live_count(db, "p13_unread") == 1);
+        // Never read, so never learned its id.
+        CHECK(!stream.query_id().has_value());
+        stream.close();
+    }
+
+    int after = live_count(db, "p13_unread");
+    for (int i = 0; i < 10 && after != 0; ++i) {
+        (void)db.query("RETURN 1");
+        after = live_count(db, "p13_unread");
+    }
+    CHECK(after == 1);
+    if (after == 0)
+        std::printf("  the id is now reachable without reading; revisit close()\n");
+}
+
+// An explicit kill still works, and repeating it is harmless.
+//
+// `connection::kill()` remains for a live query registered without a stream --
+// a bare `LIVE SELECT` run through `query()`. Using it on a stream you hold is
+// redundant now rather than wrong, and close() must not choke on an id that is
+// already dead.
+void test_explicit_kill_then_close() {
+    std::printf("timeout: explicit kill then close\n");
+    auto db = open();
+    if (!db.valid()) { std::printf("  no connection; skipped\n"); return; }
+    (void)db.query("DEFINE TABLE p13_kc SCHEMALESS");
+    if (live_count(db, "p13_kc") < 0) { std::printf("  no lives; skipped\n"); return; }
+
+    auto s = live_on(db, "p13_kc");
+    if (!s.has_value()) { std::printf("  live unavailable; skipped\n"); return; }
+    auto stream = std::move(s).value();
+
+    touch(db, "p13_kc:a");
+    const std::string id = query_id_of(stream);
+    if (id.empty()) { std::printf("  no notification; skipped\n"); return; }
+    CHECK(live_count(db, "p13_kc") == 1);
+
+    CHECK(db.kill(id.c_str()).has_value());
+    stream.close();                      // kills again; must be harmless
+
+    int after = live_count(db, "p13_kc");
+    for (int i = 0; i < 20 && after != 0; ++i) {
+        (void)db.query("RETURN 1");
+        after = live_count(db, "p13_kc");
+    }
+    CHECK(after == 0);
+}
+
 // KILL stops delivery, and does *not* end the stream.
 //
 // Both halves are asserted because both are load-bearing. The first is what
@@ -441,7 +618,7 @@ void test_kill_stops_delivery() {
 // context it came from and reports the end once that context is gone.
 //
 // Worth reaching, because 0.3.0 moved this code. `sr_stream_next` reported the
-// end as SR_NONE (0) in 0.2.x and reports it as SR_CLOSED (-1) now, so a reader
+// end as SR_AGAIN (0) in 0.2.x and reports it as SR_CLOSED (-1) now, so a reader
 // still written to the old contract reads a clean end as a failure while
 // compiling perfectly. `failure() == nullptr` and a non-error `result` are what
 // separate the two.
@@ -636,6 +813,10 @@ int main() {
     test_timeout_then_event();
     test_notification_query_id();
     test_kill_stops_delivery();
+    test_close_retires_the_query();
+    test_destructor_retires_the_query();
+    test_unread_stream_cannot_be_retired();
+    test_explicit_kill_then_close();
     test_rpc_stream_ends_on_teardown();
     test_negative_duration_is_not_sent();
     test_ended_is_not_timed_out();

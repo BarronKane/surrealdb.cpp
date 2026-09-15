@@ -7,7 +7,7 @@
 ///
 ///     int sr_x(const sr_surreal_t* db, sr_string_t* err_ptr, R** res_ptr, ...);
 ///
-/// It returns `SR_NONE` (0) on success or a negative status; on failure it
+/// It returns `SR_AGAIN` (0) on success or a negative status; on failure it
 /// writes an owned message into `err_ptr`; on success it writes the result into
 /// `res_ptr`. That regularity is the single highest-leverage fact about the C
 /// library -- it means roughly fifty hand-written check-free-wrap blocks

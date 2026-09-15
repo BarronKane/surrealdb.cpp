@@ -28,6 +28,7 @@
 #include "stream.hpp"
 #include "value.hpp"
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <utility>
@@ -103,6 +104,7 @@ public:
     /// `"mem://"` in-memory, `"surrealkv://file.skv"` on disk,
     /// `"ws://host:8000"` remote.
     [[nodiscard]] static result<connection> connect(const char* endpoint) {
+        detail::engine_started().store(true, std::memory_order_release);
         sr_surreal_t* raw = nullptr;
         return detail::invoke<connection>(
             [&](sr_string_t* e) { return ::sr_connect(e, &raw, endpoint); },
@@ -114,6 +116,7 @@ public:
                                                     const options& opts) {
         // The C view borrows from `view`, which therefore has to outlive the
         // call -- hence a named local rather than a temporary.
+        detail::engine_started().store(true, std::memory_order_release);
         options::c_view view = opts.to_c();
         sr_surreal_t* raw = nullptr;
         return detail::invoke<connection>(
@@ -127,7 +130,13 @@ public:
     [[nodiscard]] const sr_surreal_t* raw() const noexcept { return db_.get(); }
 
     /// True once any call has reported `SR_FATAL`. The handle is unusable.
-    [[nodiscard]] bool poisoned() const noexcept { return poisoned_; }
+    ///
+    /// Shared with every handle forked from this one, and with the one it was
+    /// forked from: `SR_FATAL` means the engine itself is gone, so a sibling
+    /// reporting healthy would be lying.
+    [[nodiscard]] bool poisoned() const noexcept {
+        return poisoned_->load(std::memory_order_acquire);
+    }
 
     /// Close early. The destructor does this anyway.
     void disconnect() noexcept { db_.reset(); }
@@ -151,6 +160,50 @@ public:
         auto r = use_ns(ns);
         if (!r) return r;
         return use_db(database);
+    }
+
+    // -- sessions -----------------------------------------------------------
+
+    /// Fork a session from this connection.
+    ///
+    /// The new handle talks to the same engine over the same runtime, and
+    /// carries its own session state: its own `USE` namespace and database, its
+    /// own `LET` variables, its own authentication. Changing any of those on
+    /// one handle does not touch the other.
+    ///
+    /// This is how one embedded database serves several independent users --
+    /// players, tenants, requests. It is **not** a second connection: no engine
+    /// starts, no runtime is built, no threads are added. Needs surrealdb.c
+    /// 0.3.2.
+    ///
+    /// The fork inherits this connection's namespace, database and
+    /// authentication. `new_session()` is the same thing with the
+    /// authentication cleared.
+    ///
+    /// Both handles are independent objects and either may be destroyed first;
+    /// the engine goes away with the last one. Poisoning is shared -- see
+    /// `poisoned()`.
+    [[nodiscard]] result<connection> fork_session() noexcept {
+        sr_surreal_t* out = nullptr;
+        return track(detail::invoke<connection>(
+            [&](sr_string_t* e) { return ::sr_session_fork(raw(), e, &out); },
+            [&](int) { return connection(out, alive_, poisoned_); }));
+    }
+
+    /// Fork a session and clear the authentication it inherited.
+    ///
+    /// The namespace and database are still inherited: clearing those would
+    /// hand back a handle that cannot run anything until the caller picks them
+    /// again, and `use()` is right there.
+    ///
+    /// This is the one to reach for when the new session belongs to a different
+    /// principal -- a second player, another tenant -- since inheriting a
+    /// parent's credentials is exactly the leak sessions exist to prevent.
+    [[nodiscard]] result<connection> new_session() noexcept {
+        sr_surreal_t* out = nullptr;
+        return track(detail::invoke<connection>(
+            [&](sr_string_t* e) { return ::sr_session_new(raw(), e, &out); },
+            [&](int) { return connection(out, alive_, poisoned_); }));
     }
 
     // -- introspection ------------------------------------------------------
@@ -380,7 +433,9 @@ public:
         sr_stream_t* out = nullptr;
         return track(detail::invoke<stream>(
             [&](sr_string_t* e) { return ::sr_select_live(raw(), e, &out, resource); },
-            [&](int) { return stream(out, std::weak_ptr<const void>(alive_)); }));
+            [&](int) {
+                return stream(out, raw(), std::weak_ptr<const void>(alive_));
+            }));
     }
 
     /// Kill a live query by its id, as reported by `notification::query_id`.
@@ -392,11 +447,19 @@ public:
     /// around, and `REMOVE TABLE` strands a stream the same way, so it is a
     /// property of the path and not of this call.
     ///
-    /// To retire a live query you hold a `stream` for, call `stream::close()`
-    /// instead -- it stops the query by a route the defect does not touch and
-    /// releases the stream in the same step. Reach for `kill()` only for a
-    /// query registered some other way, such as a bare `LIVE SELECT` run
-    /// through `query()`, where there is no stream to strand.
+    /// **If you hold a `stream` for the query, you do not need this.**
+    /// `stream::close()` retires the subscription and releases the reader as
+    /// one operation, and the destructor calls it, so scope exit is already
+    /// correct. Calling this as well is redundant rather than wrong -- killing
+    /// an id twice is harmless.
+    ///
+    /// What it is for is a live query registered *without* a stream: a bare
+    /// `LIVE SELECT` run through `query()`, which answers with the id but hands
+    /// back no reader. That is the case `stream::close()` cannot help with.
+    ///
+    /// Note that this call alone leaves any stream on that query open and
+    /// silent -- it stops delivery without ending the stream. `INFO FOR
+    /// TABLE`'s `lives` is where the datastore half is visible.
     [[nodiscard]] result<void> kill(const char* query_id) noexcept {
         return track(detail::invoke([&](sr_string_t* e) {
             return ::sr_kill(raw(), e, query_id);
@@ -458,10 +521,26 @@ public:
 private:
     explicit connection(sr_surreal_t* raw) noexcept : db_(raw) {}
 
+    /// A fork: a new handle onto an engine this one already owns.
+    ///
+    /// It shares both pieces of shared state deliberately, because the C does:
+    ///
+    /// - the **liveness token**, so a stream opened on any handle stays
+    ///   killable while any handle survives. The runtime is reference-counted
+    ///   on the C side and dies with the last handle, so a per-handle token
+    ///   would expire early and make a perfectly valid stream leak.
+    /// - the **poison flag**, because `SR_FATAL` means the engine is gone. A
+    ///   fork that reported healthy while talking to a dead engine would be
+    ///   worse than useless.
+    connection(sr_surreal_t* raw, std::shared_ptr<const void> alive,
+               std::shared_ptr<std::atomic<bool>> poisoned) noexcept
+        : db_(raw), alive_(std::move(alive)), poisoned_(std::move(poisoned)) {}
+
     /// Latch the poison flag from any result that reports SR_FATAL.
     template <class T>
     result<T> track(result<T> r) noexcept {
-        if (!r.has_value() && r.error().is_fatal()) poisoned_ = true;
+        if (!r.has_value() && r.error().is_fatal())
+            poisoned_->store(true, std::memory_order_release);
         return r;
     }
 
@@ -528,7 +607,9 @@ private:
     /// runtime it borrows -- is gone.
     std::shared_ptr<const void> alive_{std::make_shared<const char>('\0')};
 
-    bool poisoned_{false};
+    /// Shared with forks; see `poisoned()`.
+    std::shared_ptr<std::atomic<bool>> poisoned_{
+        std::make_shared<std::atomic<bool>>(false)};
 };
 
 // ---------------------------------------------------------------------------
