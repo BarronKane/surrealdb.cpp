@@ -705,6 +705,38 @@ cmake -S . -B build && cmake --build build
 ctest --test-dir build
 ```
 
+### Build it with Ninja
+
+```bash
+cmake -S . -B build -G Ninja && cmake --build build
+```
+
+Not a style preference. Every test binary statically links the whole Rust
+library, and in a Debug build that archive is over a gigabyte of mostly debug
+info — so a link costs about 2.5 GB, and there are twenty-five of them. `make
+-j` is one number for compiling and linking both, so it will start twenty links
+together and ask for forty gigabytes. Ninja supports job pools, and this project
+configures one: compiles stay at full parallelism while links are capped by
+available memory. The configure summary prints which number it picked, and says
+so when the generator cannot honour it.
+
+It also selects `mold` or `lld` when one is on `PATH`, because the default
+linker is about ten times slower on an archive this size — measured at 9.8 s a
+link against 1.0 s. Note the two changes pull in opposite directions on memory:
+lld is faster *and* hungrier per link, so the job pool is what makes it safe to
+switch. Either can be overridden:
+
+```bash
+cmake -S . -B build -G Ninja \
+      -DSURREALDB_CPP_LINKER=bfd \
+      -DSURREALDB_CPP_LINK_JOBS=2
+```
+
+Set `SURREALDB_RELEASE=ON` if you do not need to debug into the C library — a
+release archive is about 269 MB against 1.4 GB, which makes every link cheaper
+still. Both settings are top-level only: an embedding host picks its own linker
+and its own parallelism.
+
 `find_package(surrealdb_c)` locates the C SDK, preferring an installed package
 over the bundled checkout, so a system install from a distro package is used
 without editing anything. Set `SURREALDB_C_FORCE_SUBPROJECT=ON` to invert that
@@ -751,6 +783,8 @@ compiler, standard library and exception settings is not optional.
 | `SURREALDB_RELEASE` | OFF | build surrealdb.c's Rust library in release mode |
 | `SURREALDB_SANITIZE` | "" | `address`, `undefined`, `thread`, or a comma-separated list — instruments every test target |
 | `SURREALDB_CPP_SWEEP_STANDARDS` | ON | compile every suite at every supported C++ standard |
+| `SURREALDB_CPP_LINKER` | auto | `mold`/`lld` if present; or name one, or empty to leave alone |
+| `SURREALDB_CPP_LINK_JOBS` | auto | concurrent links, sized from RAM. Ninja only |
 
 ### C++20 modules
 

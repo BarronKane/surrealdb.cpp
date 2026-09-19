@@ -202,6 +202,108 @@ if(PROJECT_IS_TOP_LEVEL AND NOT DEFINED CMAKE_INCLUDE_CURRENT_DIR)
     set(CMAKE_INCLUDE_CURRENT_DIR ON)
 endif()
 
+# ============================================================================
+# Linking
+# ============================================================================
+#
+# Every test binary statically links the whole Rust library, and in a Debug
+# build that archive is well over a gigabyte of mostly DWARF. Measured on one
+# link of one test:
+#
+#     bfd, debug info kept      1.70 GB    9.8 s
+#     lld, debug info kept      2.44 GB    1.0 s
+#     lld, --strip-debug        1.28 GB    0.6 s
+#
+# Two things follow, and the second is the one that bites.
+#
+# The default linker is slow here: ten seconds a link, twenty-five links. lld
+# is ten times faster and is almost always installed alongside clang.
+#
+# But lld also wants *more* memory per link, so switching linker without
+# capping how many run at once makes the spike worse. `make -j32` with
+# twenty-five link targets will happily start twenty of them together and ask
+# for forty gigabytes. That is the "why is my machine on fire" case, and the
+# fix is a job pool, not a faster linker.
+#
+# Both are top-level only. An embedding host picks its own linker and its own
+# parallelism, and neither is this library's business to set.
+
+if(PROJECT_IS_TOP_LEVEL)
+    # --- linker ------------------------------------------------------------
+    set(SURREALDB_CPP_LINKER "auto"
+        CACHE STRING "Linker to use: auto, lld, mold, gold, bfd, or empty to leave alone")
+
+    if(SURREALDB_CPP_LINKER STREQUAL "auto")
+        set(_sdb_linker "")
+        foreach(_cand mold lld)
+            find_program(SURREALDB_CPP_LINKER_${_cand} ${_cand})
+            if(SURREALDB_CPP_LINKER_${_cand})
+                set(_sdb_linker ${_cand})
+                break()
+            endif()
+        endforeach()
+    else()
+        set(_sdb_linker "${SURREALDB_CPP_LINKER}")
+    endif()
+
+    if(_sdb_linker AND NOT MSVC)
+        # Checked rather than assumed: a linker can be on PATH and still be
+        # rejected by the compiler driver, and finding that out at the first
+        # link of a long build is a poor trade for one try here.
+        include(CheckCXXSourceCompiles)
+        set(CMAKE_REQUIRED_LINK_OPTIONS "-fuse-ld=${_sdb_linker}")
+        check_cxx_source_compiles("int main(){return 0;}" SURREALDB_CPP_LINKER_WORKS)
+        unset(CMAKE_REQUIRED_LINK_OPTIONS)
+
+        if(SURREALDB_CPP_LINKER_WORKS)
+            add_link_options("-fuse-ld=${_sdb_linker}")
+            set(SURREALDB_CPP_LINKER_IN_USE "${_sdb_linker}")
+        else()
+            set(SURREALDB_CPP_LINKER_IN_USE "system default (-fuse-ld=${_sdb_linker} rejected)")
+        endif()
+    else()
+        set(SURREALDB_CPP_LINKER_IN_USE "system default")
+    endif()
+
+    # --- how many links at once -------------------------------------------
+    #
+    # Sized from memory rather than cores, because memory is what runs out.
+    # Roughly 2.5 GB a link with lld on a debug archive, and a build has
+    # compiles in flight too, so budget about an eighth of RAM.
+    #
+    # Ninja only: the Makefiles generator has no equivalent, and `make -j` is
+    # one number for compiling and linking both. That is worth knowing rather
+    # than working around -- on Makefiles this silently does nothing, which is
+    # why the summary prints what actually happened.
+    set(SURREALDB_CPP_LINK_JOBS "auto"
+        CACHE STRING "Concurrent link jobs (Ninja only). auto, a number, or empty to leave alone")
+
+    if(SURREALDB_CPP_LINK_JOBS STREQUAL "auto")
+        cmake_host_system_information(RESULT _sdb_ram QUERY TOTAL_PHYSICAL_MEMORY)
+        cmake_host_system_information(RESULT _sdb_cpus QUERY NUMBER_OF_LOGICAL_CORES)
+        math(EXPR _sdb_link_jobs "${_sdb_ram} / 8192")          # MB -> ~8 GB each
+        if(_sdb_link_jobs LESS 1)
+            set(_sdb_link_jobs 1)
+        endif()
+        if(_sdb_link_jobs GREATER ${_sdb_cpus})
+            set(_sdb_link_jobs ${_sdb_cpus})
+        endif()
+    else()
+        set(_sdb_link_jobs "${SURREALDB_CPP_LINK_JOBS}")
+    endif()
+
+    if(_sdb_link_jobs AND CMAKE_GENERATOR MATCHES "Ninja")
+        set_property(GLOBAL APPEND PROPERTY JOB_POOLS surrealdb_link=${_sdb_link_jobs})
+        set(CMAKE_JOB_POOL_LINK surrealdb_link)
+        set(SURREALDB_CPP_LINK_JOBS_IN_USE "${_sdb_link_jobs}")
+    elseif(_sdb_link_jobs)
+        set(SURREALDB_CPP_LINK_JOBS_IN_USE
+            "unlimited (job pools need Ninja; -G Ninja to cap at ${_sdb_link_jobs})")
+    else()
+        set(SURREALDB_CPP_LINK_JOBS_IN_USE "unlimited")
+    endif()
+endif()
+
 # Platform defaults, again only when this is the project being built.
 #
 # `add_compile_definitions` and `add_definitions` are directory-scoped, so they
@@ -385,6 +487,8 @@ if(PROJECT_IS_TOP_LEVEL)
     message(STATUS "C++ standard: ${CMAKE_CXX_STANDARD} (floor is 17)")
     message(STATUS "Modules:      ${SURREALDB_USE_MODULES}")
     message(STATUS "Testing:      ${BUILD_TESTING}")
+    message(STATUS "Linker:       ${SURREALDB_CPP_LINKER_IN_USE}")
+    message(STATUS "Link jobs:    ${SURREALDB_CPP_LINK_JOBS_IN_USE}")
     message(STATUS "Examples:     ${BUILD_EXAMPLES}")
     if(SURREALDB_SANITIZE)
         message(STATUS "Sanitizers:   ${SURREALDB_SANITIZE}")
