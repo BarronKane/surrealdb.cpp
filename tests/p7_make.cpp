@@ -532,6 +532,297 @@ void test_round_trip() {
     CHECK(!vars.empty());
 }
 
+
+// ---------------------------------------------------------------------------
+// Record id key shapes
+// ---------------------------------------------------------------------------
+
+// `thing` wrote text keys and only text keys until surrealdb.c 0.3.2+,
+// while `thing_ref` read all four shapes. The gap was silent at every layer:
+// a key of the wrong shape is a well-formed record id that matches nothing, so
+// the database answers with zero rows and no error.
+//
+// Construction alone would pass while still being wrong, so every check here
+// goes to the database and counts rows.
+
+void test_thing_every_key_shape() {
+    auto db = sdb::connection::connect("memory");
+    if (!db) { std::printf("make: record id shapes (skipped)\n"); return; }
+    std::printf("make: record ids round-trip in every key shape\n");
+
+    auto& c = db.value();
+    CHECK(c.use("p7_ns", "p7_ids").has_value());
+
+    // One record of each id shape, created by the database from SurrealQL so
+    // that the shapes are the server's, not this library's.
+    CHECK(c.query("CREATE k:1 SET tag = 'num'; "
+                  "CREATE k:abc SET tag = 'txt'; "
+                  "CREATE k:['a', 1] SET tag = 'arr'; "
+                  "CREATE k:{ x: 1 } SET tag = 'obj';").has_value());
+
+    // The read side agrees with the four kinds before anything is written.
+    auto all = c.query("SELECT * FROM k");
+    CHECK(all.has_value());
+    if (all) {
+        auto& qr = all.value();
+        auto rows = qr.single();
+        CHECK(rows.has_value());
+        if (rows) CHECK(rows.value().size() == 4);
+    }
+
+    // Bind each constructor and ask for its own record back. A wrong shape
+    // returns zero rows rather than failing, so `found` is the assertion.
+    auto found = [&](sdb::owned_value id) {
+        sdb::object_builder vars;
+        vars.set("r", id);
+        auto r = c.query("SELECT tag FROM $r", vars);
+        if (!r) return std::string("<query failed>");
+        auto& qr = r.value();
+        auto rows = qr.single();
+        if (!rows) return std::string("<statement failed>");
+        auto v = rows.value();
+        if (v.size() != 1) return std::string("<no row>");
+        auto obj = v[0].as_object();
+        if (!obj) return std::string("<not an object>");
+        auto tag = obj->get("tag");
+        if (!tag) return std::string("<no tag>");
+        auto s = tag->as_string();
+        return s ? std::string(*s) : std::string("<not a string>");
+    };
+
+    CHECK(found(sdb::make::thing("k", 1))     == "num");
+    CHECK(found(sdb::make::thing("k", "abc")) == "txt");
+
+    sdb::array_builder arr;
+    arr.push("a").push(1);
+    CHECK(found(sdb::make::thing("k", arr)) == "arr");
+
+    sdb::object_builder obj;
+    obj.set("x", 1);
+    CHECK(found(sdb::make::thing("k", obj)) == "obj");
+
+    // The std::string overload takes the text path, not the integral one.
+    CHECK(found(sdb::make::thing("k", std::string("abc"))) == "txt");
+
+    // Every shape is a `thing` value regardless of key.
+    CHECK(view(sdb::make::thing("k", 1)).kind()   == sdb::value_kind::thing);
+    CHECK(view(sdb::make::thing("k", arr)).kind() == sdb::value_kind::thing);
+    CHECK(view(sdb::make::thing("k", obj)).kind() == sdb::value_kind::thing);
+
+    // And the read side reports the kind that was written, which is what makes
+    // `thing_ref::visit` usable for deciding how to rebuild one.
+    auto kind_of = [&](const char* stmt) {
+        auto r = c.query(stmt);
+        if (!r) return sdb::id_kind::text;
+        auto& qr = r.value();
+        auto rows = qr.single();
+        if (!rows || rows.value().size() != 1) return sdb::id_kind::text;
+        return sdb::thing(rows.value()[0]).kind();
+    };
+    CHECK(kind_of("SELECT VALUE id FROM k:1")        == sdb::id_kind::number);
+    CHECK(kind_of("SELECT VALUE id FROM k:abc")      == sdb::id_kind::text);
+    CHECK(kind_of("SELECT VALUE id FROM k:['a', 1]") == sdb::id_kind::array);
+    CHECK(kind_of("SELECT VALUE id FROM k:{ x: 1 }") == sdb::id_kind::object);
+}
+
+// The reason all four constructors have to exist, pinned as behaviour.
+//
+// `k:7` and `k:"7"` are different records. Confusing them does not raise --
+// the query succeeds and returns nothing -- so this asserts the silence
+// directly. If SurrealDB ever starts coercing between the two, this fails and
+// the docs warning on `thing()` needs revisiting.
+void test_thing_shape_mismatch_is_silent() {
+    auto db = sdb::connection::connect("memory");
+    if (!db) { std::printf("make: record id mismatch (skipped)\n"); return; }
+    std::printf("make: a mismatched record id key fails silently\n");
+
+    auto& c = db.value();
+    CHECK(c.use("p7_ns", "p7_mismatch").has_value());
+    CHECK(c.query("CREATE n:7 SET tag = 'numeric';").has_value());
+
+    auto rows_for = [&](sdb::owned_value id) {
+        sdb::object_builder vars;
+        vars.set("r", id);
+        auto r = c.query("SELECT * FROM $r", vars);
+        CHECK(r.has_value());              // no error either way
+        if (!r) return -1;
+        auto& qr = r.value();
+        auto rows = qr.single();
+        CHECK(rows.has_value());           // and the statement succeeds
+        return rows ? rows.value().size() : -1;
+    };
+
+    // The right shape finds it.
+    CHECK(rows_for(sdb::make::thing("n", 7)) == 1);
+
+    // The wrong shape does not, and says nothing about it. This is the bug the
+    // text-only constructor made unavoidable.
+    CHECK(rows_for(sdb::make::thing("n", "7")) == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Objects are no longer a one-way street
+// ---------------------------------------------------------------------------
+
+// Read a record, change one field, write it back. Every database client does
+// this, and until `object_builder(object_view)` existed it could not be
+// expressed: a query hands back an `object_view`, every write wanted an
+// `object_builder`, and nothing converted between them.
+void test_object_round_trip() {
+    auto db = sdb::connection::connect("memory");
+    if (!db) { std::printf("make: object round trip (skipped)\n"); return; }
+    std::printf("make: read-modify-write round trip\n");
+
+    auto& c = db.value();
+    CHECK(c.use("p7_ns", "p7_rt").has_value());
+
+    sdb::object_builder seed;
+    seed.set("name", "ada").set("age", 36).set("active", true);
+    auto made = c.create("person:ada", seed);
+    CHECK(made.has_value());
+    if (!made) return;
+
+    // The `owned_object` a create returns is now an input as well as an
+    // output -- this is the conversion that used to be missing entirely.
+    auto& record = made.value();
+    sdb::object_builder edited{sdb::view(record)};
+
+    // Every field of the source came across, `id` included -- the copy is of
+    // what the database returned, not of what was sent to it.
+    CHECK(edited.size() == sdb::view(record).size());
+    CHECK(edited.size() == seed.size() + 1);        // the seed plus `id`
+    CHECK(edited.view().contains("id"));
+
+    edited.set("age", 37);
+
+    CHECK(c.update("person:ada", edited).has_value());
+
+    auto after = c.query("SELECT age, name, active FROM person:ada");
+    CHECK(after.has_value());
+    if (!after) return;
+    auto& qr = after.value();
+    auto rows = qr.single();
+    CHECK(rows.has_value());
+    if (!rows || rows.value().size() != 1) { CHECK(false); return; }
+
+    auto rec = rows.value()[0].as_object();
+    CHECK(rec.has_value());
+    if (!rec) return;
+
+    // The edited field changed...
+    auto age = rec->get("age");
+    CHECK(age.has_value() && age->as_int().value_or(-1) == 37);
+    // ...and the untouched ones survived, which is the part a hand-rebuilt
+    // object gets wrong by omission.
+    auto name = rec->get("name");
+    CHECK(name.has_value() && name->as_string().value_or("") == "ada");
+    auto active = rec->get("active");
+    CHECK(active.has_value() && active->as_bool().value_or(false));
+
+    // The copy is independent: editing it did not disturb the source.
+    auto src = sdb::view(record).get("age");
+    CHECK(src.has_value() && src->as_int().value_or(-1) == 36);
+
+    // The degenerate inputs, which is where the gather's bookkeeping shows.
+    // Under ASan these are the leak checks: `sr_object_keys` allocates its
+    // block whether or not the object has anything in it.
+    sdb::object_builder empty_src;
+    sdb::object_builder from_empty{empty_src.view()};
+    CHECK(from_empty.empty());
+    CHECK(from_empty.raw() != nullptr);          // usable, not null
+    from_empty.set("added", 1);                  // and writable afterwards
+    CHECK(from_empty.size() == 1);
+
+    sdb::object_builder from_invalid{sdb::object_view()};
+    CHECK(from_invalid.empty());
+    CHECK(from_invalid.raw() != nullptr);
+
+    // Enumerating an empty object allocates and must not leak either.
+    CHECK(sdb::keys_of(empty_src.view()).empty());
+}
+
+// `object_arg` accepts every shape an object reaches this library as, so the
+// same call site takes a builder, a view, an owned object or a pointer.
+void test_object_arg_accepts_every_shape() {
+    auto db = sdb::connection::connect("memory");
+    if (!db) { std::printf("make: object_arg shapes (skipped)\n"); return; }
+    std::printf("make: object_arg accepts every object shape\n");
+
+    auto& c = db.value();
+    CHECK(c.use("p7_ns", "p7_arg").has_value());
+
+    sdb::object_builder vars;
+    vars.set("n", 41);
+
+    auto returns_42 = [&](sdb::result<sdb::query_results>&& r) {
+        if (!r) return false;
+        auto& qr = r.value();
+        auto rows = qr.single();
+        if (!rows || rows.value().size() != 1) return false;
+        return rows.value()[0].as_int().value_or(-1) == 42;
+    };
+
+    // Reference, the spelling that always worked.
+    CHECK(returns_42(c.query("RETURN $n + 1", vars)));
+    // Pointer, the spelling the optional parameter used to require.
+    CHECK(returns_42(c.query("RETURN $n + 1", &vars)));
+    // A borrowed view of the same object.
+    CHECK(returns_42(c.query("RETURN $n + 1", vars.view())));
+    // An owned object, straight off a create.
+    auto owned = c.create("argrec:1", vars);
+    CHECK(owned.has_value());
+    if (owned) CHECK(sdb::object_arg(owned.value()).valid());
+    // And no object at all, both ways.
+    CHECK(c.query("RETURN 1").has_value());
+    CHECK(c.query("RETURN 1", nullptr).has_value());
+
+    // `make::object` takes the same set, which is what stops `owned_object`
+    // being a terminal type.
+    CHECK(view(sdb::make::object(vars)).kind()        == sdb::value_kind::object);
+    CHECK(view(sdb::make::object(vars.view())).kind() == sdb::value_kind::object);
+    if (owned) {
+        CHECK(view(sdb::make::object(owned.value())).kind() == sdb::value_kind::object);
+    }
+}
+
+// The array half of the same idea: `array_arg` carries the `(ptr, len)` header
+// by value, so an `array_view` off a result reaches a call that wants an array
+// without being rebuilt through a builder.
+void test_array_arg_accepts_every_shape() {
+    std::printf("make: array_arg accepts every array shape\n");
+
+    sdb::array_builder b;
+    b.push(1).push(2).push(3);
+
+    CHECK(view(sdb::make::array(b)).kind() == sdb::value_kind::array);
+    CHECK(view(sdb::make::set(b)).kind()   == sdb::value_kind::set);
+
+    // A view of the same elements builds an equal array.
+    auto from_builder = sdb::make::array(b);
+    auto from_view    = sdb::make::array(b.view());
+    CHECK(view(from_builder) == view(from_view));
+
+    // An owned array, and a raw header.
+    auto owned = sdb::array_from(b.view());
+    CHECK(view(sdb::make::array(owned)).kind() == sdb::value_kind::array);
+    CHECK(view(sdb::make::array(b.raw())).kind() == sdb::value_kind::array);
+
+    // Absent is distinct from present-and-empty, which is why `array_arg`
+    // carries a flag rather than testing the pointer.
+    CHECK(sdb::array_arg().raw() == nullptr);
+    CHECK(sdb::array_arg(nullptr).raw() == nullptr);
+    CHECK(sdb::array_arg(b.view()).valid());
+    CHECK(sdb::array_arg(b.view()).raw()->len == 3);
+
+    // Copying one keeps `raw()` pointing at its own header, not the original's
+    // -- the hazard of carrying a struct by value behind a pointer accessor.
+    sdb::array_arg first(b.view());
+    sdb::array_arg second = first;
+    CHECK(second.raw() != first.raw());     // its own header, not the original's
+    CHECK(second.raw()->len == 3);
+    CHECK(second.raw()->arr == first.raw()->arr);   // borrowing the same elements
+}
+
 } // namespace
 
 int main() {
@@ -559,6 +850,11 @@ int main() {
     test_bounds_and_range();
     test_equality();
     test_round_trip();
+    test_thing_every_key_shape();
+    test_thing_shape_mismatch_is_silent();
+    test_object_round_trip();
+    test_object_arg_accepts_every_shape();
+    test_array_arg_accepts_every_shape();
 
     if (g_db) sr_surreal_disconnect(g_db);
 

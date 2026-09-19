@@ -9,10 +9,13 @@
 #include "array.hpp"
 #include "value.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 namespace surrealdb {
 
@@ -24,6 +27,32 @@ namespace surrealdb {
 class object_builder {
 public:
     object_builder() noexcept : obj_(::sr_object_new()) {}
+
+    /// Adopt an object this library already handed you.
+    ///
+    /// The other half of `release()`, which was a one-way street until this
+    /// existed: `create()` returns an `owned_object` and nothing took one back,
+    /// so the most-used return type in the library could not be fed into any of
+    /// its own inputs.
+    explicit object_builder(owned_object adopted) noexcept
+        : obj_(std::move(adopted)) {}
+
+    /// Copy a borrowed object into a writable one.
+    ///
+    /// This is the read-modify-write bridge: `object_view` is what a query
+    /// hands back and it is read-only, so without this, changing one field of a
+    /// record you just read means rebuilding every other field by hand.
+    ///
+    /// **O(n), and it allocates**, where `array_builder(array_view)` is one
+    /// bulk copy. Objects are opaque on the C side, so the keys have to be
+    /// enumerated (one allocation, freed here) and each value looked up before
+    /// `sr_object_from_entries` can copy them in one call. The values are
+    /// deep-copied by the C, so `src` stays yours and stays valid.
+    ///
+    /// Not `noexcept`, and deliberately unlike the rest of this class: the
+    /// gather uses `std::vector`. Same trade `array_from(Container)` makes.
+    explicit object_builder(object_view src)
+        : obj_(from_view(src)) {}
 
     object_builder(object_builder&&) noexcept = default;
     object_builder& operator=(object_builder&&) noexcept = default;
@@ -151,7 +180,82 @@ private:
         return *this;
     }
 
+    /// The gather behind `object_builder(object_view)`.
+    ///
+    /// The `sr_value_t` structs are copied *shallowly* into the block and the
+    /// originals are never freed here -- they belong to `src`. That is sound
+    /// only because `sr_object_from_entries` deep-copies what it is given, the
+    /// same contract `array_from(Container)` relies on for
+    /// `sr_array_from_values`.
+    static owned_object from_view(object_view src) {
+        std::vector<const char*> keys;
+        std::vector<sr_value_t>  vals;
+
+        if (src.valid()) {
+            char** raw_keys = nullptr;
+            const int n = ::sr_object_keys(src.raw(), &raw_keys);
+            // Owns the key block for the rest of this function, including the
+            // early return below -- `sr_object_keys` allocates it.
+            owned_strings held(raw_keys, n > 0 ? n : 0);
+            if (n > 0) {
+                keys.reserve(static_cast<std::size_t>(n));
+                vals.reserve(static_cast<std::size_t>(n));
+                for (int i = 0; i < n; ++i) {
+                    const char* k = held[i];
+                    if (!k) continue;
+                    const sr_value_t* v = ::sr_object_get(src.raw(), k);
+                    if (!v) continue;
+                    keys.push_back(k);
+                    vals.push_back(*v);
+                }
+            }
+            // `held` must outlive the call: the keys are borrowed until the C
+            // has copied them.
+            return owned_object(::sr_object_from_entries(
+                keys.empty() ? nullptr : keys.data(),
+                vals.empty() ? nullptr : vals.data(),
+                static_cast<int>(keys.size())));
+        }
+
+        // A null or empty source still yields a usable empty object rather
+        // than a null one, so a builder is never in a state `set()` ignores.
+        return owned_object(::sr_object_from_entries(nullptr, nullptr, 0));
+    }
+
     owned_object obj_;
+};
+
+/// An object argument: anything the C can read as one.
+///
+/// Every entry point that takes object content -- `create`, `update`, `merge`,
+/// query variables, auth params -- reduces to one `const sr_object_t*` at the
+/// call. This is that pointer, with implicit conversions from each of the four
+/// ways this library hands you an object, so a value read out of a query can be
+/// echoed straight back without being rebuilt key by key.
+///
+/// One pointer wide and trivially copyable; pass it by value. It borrows, so it
+/// is only valid while whatever it was built from is -- which for a function
+/// parameter is the whole call, since the argument it converted from lives to
+/// the end of the full expression. That is why there are no deleted rvalue
+/// overloads here and there are on `view()`: `view()` hands a borrow *back* to
+/// outlive the statement, this one is consumed inside it.
+class object_arg {
+public:
+    /// No object. What `create(resource, {})` and an omitted `vars` mean.
+    object_arg() noexcept = default;
+    object_arg(std::nullptr_t) noexcept {}
+
+    object_arg(const object_builder& b) noexcept : o_(b.raw()) {}
+    /// So the pointer spelling of an optional argument keeps working.
+    object_arg(const object_builder* b) noexcept : o_(b ? b->raw() : nullptr) {}
+    object_arg(object_view v) noexcept : o_(v.raw()) {}
+    object_arg(const owned_object& o) noexcept : o_(o ? o.addr() : nullptr) {}
+
+    [[nodiscard]] const sr_object_t* raw() const noexcept { return o_; }
+    [[nodiscard]] bool valid() const noexcept { return o_ != nullptr; }
+
+private:
+    const sr_object_t* o_{nullptr};
 };
 
 /// The keys of an object, owned.
@@ -164,7 +268,11 @@ public:
     explicit object_keys(const sr_object_t* obj) noexcept {
         char** raw = nullptr;
         const int n = obj ? ::sr_object_keys(obj, &raw) : 0;
-        if (n > 0 && raw) keys_ = owned_strings(raw, n);
+        // Adopt whenever the C handed back a block, *including* a zero-length
+        // one. Guarding on `n > 0` instead leaked the outer array for an empty
+        // object -- `owned_strings` frees on a non-null pointer regardless of
+        // length, which is the right rule and was simply not being reached.
+        if (raw) keys_ = owned_strings(raw, n > 0 ? n : 0);
     }
 
     [[nodiscard]] int size() const noexcept { return keys_.size(); }

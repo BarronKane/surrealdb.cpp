@@ -35,6 +35,7 @@
 #include "results.hpp"
 #include "value.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -233,7 +234,9 @@ public:
         // same reason `stream::next` folds it in.
         if (rc == SR_CLOSED || rc == SR_AGAIN) return owned_byte_array();
 
-        return error(static_cast<error_code>(rc), owned_string());
+        const error_code code = static_cast<error_code>(rc);
+        if (code == error_code::fatal) poison();
+        return error(code, owned_string());
     }
 
     /// Wait for the next notification, giving up after `timeout`.
@@ -335,15 +338,28 @@ private:
         // agree on this code, which they did not before 0.3.0.
         if (rc == SR_CLOSED) return poll<owned_byte_array>(poll_state::ended);
 
-        return error(static_cast<error_code>(rc), owned_string());
+        const error_code code = static_cast<error_code>(rc);
+        if (code == error_code::fatal) poison();
+        return error(code, owned_string());
+    }
+
+    /// Latch the *context's* poison flag on a fatal read, for the reason
+    /// `stream::poison()` gives: a subscription is the one place `SR_FATAL` is
+    /// seen away from the handle that reports it.
+    void poison() noexcept {
+        if (poisoned_) poisoned_->store(true, std::memory_order_release);
     }
 
     friend class rpc;
-    rpc_stream(sr_rpc_stream_t* raw, std::weak_ptr<const void> alive) noexcept
-        : handle_(raw), alive_(std::move(alive)) {}
+    rpc_stream(sr_rpc_stream_t* raw, std::weak_ptr<const void> alive,
+               std::shared_ptr<std::atomic<bool>> poisoned) noexcept
+        : handle_(raw), alive_(std::move(alive)), poisoned_(std::move(poisoned)) {}
 
     owned_rpc_stream handle_;
     std::weak_ptr<const void> alive_;
+
+    /// Shared with the context this came from; see `poison()`.
+    std::shared_ptr<std::atomic<bool>> poisoned_;
     bool done_{false};
 };
 
@@ -386,7 +402,13 @@ public:
     }
 
     [[nodiscard]] bool valid() const noexcept { return static_cast<bool>(handle_); }
-    [[nodiscard]] bool poisoned() const noexcept { return poisoned_; }
+    /// Safe on a moved-from handle, which is the reason for the branch: the
+    /// flag is a shared pointer and moving hands it away, so an unguarded load
+    /// would be a null dereference on a query that is otherwise harmless to
+    /// ask. A handle with no flag has seen nothing.
+    [[nodiscard]] bool poisoned() const noexcept {
+        return poisoned_ && poisoned_->load(std::memory_order_acquire);
+    }
     [[nodiscard]] const sr_surreal_rpc_t* raw() const noexcept { return handle_.get(); }
 
     // -- requests ------------------------------------------------------------
@@ -474,12 +496,12 @@ public:
     /// the route that keeps the registry exact.
     [[nodiscard]] result<query_results> query_on(
             const session_id& session, const char* surql,
-            const object_builder* vars = nullptr) noexcept {
+            object_arg vars = {}) noexcept {
         sr_arr_res_t* out = nullptr;
         return track(detail::invoke<query_results>(
             [&](sr_string_t* e) {
                 return ::sr_rpc_query_on(raw(), e, &out, session.raw(), surql,
-                                         vars ? vars->raw() : nullptr);
+                                         vars.raw());
             },
             [&](int n) { return query_results(owned_arr_results(out, n)); }));
     }
@@ -592,7 +614,7 @@ public:
             return ::sr_surreal_rpc_notifications(raw(), e, &raw_stream);
         }));
         if (!r) return std::move(r).error();
-        return rpc_stream(raw_stream, std::weak_ptr<const void>(alive_));
+        return rpc_stream(raw_stream, std::weak_ptr<const void>(alive_), poisoned_);
     }
 
     /// Disconnect early.
@@ -611,7 +633,8 @@ private:
     /// Latch the poison flag, and refuse to make any further call once set.
     template <class T>
     result<T> track(result<T> r) noexcept {
-        if (!r && r.error().code() == error_code::fatal) poisoned_ = true;
+        if (!r && r.error().is_fatal() && poisoned_)
+            poisoned_->store(true, std::memory_order_release);
         return r;
     }
 
@@ -619,7 +642,11 @@ private:
     /// Liveness token handed to streams as a weak reference, so a stream that
     /// outlives this context can tell.
     std::shared_ptr<const void> alive_;
-    bool poisoned_{false};
+    /// A shared atomic rather than a plain `bool`, to match `connection`:
+    /// this is the *multi-session* surface, and its notification streams
+    /// latch the same flag from whichever thread is reading them.
+    std::shared_ptr<std::atomic<bool>> poisoned_{
+        std::make_shared<std::atomic<bool>>(false)};
 };
 
 } // namespace surrealdb

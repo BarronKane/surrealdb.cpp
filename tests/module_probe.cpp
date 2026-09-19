@@ -297,12 +297,15 @@ void probe_rpc() {
         (void)ro.to_c();
         expect(sdb::c_version >= sdb::required_c_version, "c version floor");
         // Not pinned to a value -- it tracks the anchored dependency. What is
-        // pinned is that the constant and the macro agree, so a module
-        // consumer reading the constant is told the same thing as a header
-        // consumer reading the macro.
-        expect(sdb::has_unbounded_stream_read ==
-               (SURREALDB_HAS_UNBOUNDED_STREAM_READ != 0),
-               "unbounded read flag mirrors its macro");
+        // pinned here is that the *constant* is reachable at all, because a
+        // module consumer has nothing else: macros do not cross a module
+        // boundary, which is the entire reason the constant exists. Asserting
+        // it against `SURREALDB_HAS_UNBOUNDED_STREAM_READ` is what this used to
+        // do, and it could not compile in the one build it is compiled in.
+        // compat_probe.cpp makes that comparison, where both are visible.
+        expect(sdb::has_unbounded_stream_read || !sdb::has_unbounded_stream_read,
+               "unbounded read flag is reachable without the macro");
+        expect(sdb::has_unbounded_stream_read, "unbounded read is on");
     }
 
     // Typed queries on a session -- 0.3.0's sr_rpc_query_on.

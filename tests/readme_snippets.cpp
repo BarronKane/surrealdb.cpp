@@ -96,6 +96,25 @@ int main() {
     (void)same;
     debug_print(value(r.get()));
 
+    // -- Reading, changing, writing back --
+    {
+        object_builder seed;
+        seed.set("name", "ada");
+        auto made = db.create("person:ada", seed);
+        if (made) {
+            object_builder edited{view(made.value())};
+            edited.set("age", 37);
+            (void)db.update("person:ada", edited);
+        }
+
+        object_builder vars;
+        vars.set("n", 41);
+        (void)db.query("RETURN $n + 1", vars);
+        (void)db.query("RETURN $n + 1", &vars);
+        (void)db.query("RETURN $n + 1", vars.view());
+        (void)db.query("RETURN 1");
+    }
+
     // -- Building arrays --
     array_builder args;
     args.push("hello").push(1).push(3);
@@ -143,6 +162,16 @@ int main() {
         }
     }
     {
+        // Every record id key shape, one overload each.
+        (void)make::thing("k", "abc");
+        (void)make::thing("k", 1);
+        {
+            array_builder key; key.push("a").push(1);
+            (void)make::thing("k", key);
+            object_builder composite; composite.set("x", 1);
+            (void)make::thing("k", composite);
+        }
+
         auto rid = make::thing("person", "ada");
         value row = value(rid.get());
         auto t = thing(row);

@@ -61,9 +61,12 @@ set(SURREALDB_C_GIT_REPOSITORY "https://github.com/BarronKane/surrealdb.c.git"
 # SurrealDB carrying live-query fixes that are still an open PR upstream. There
 # is no tag to name yet. Move this back to a tag when there is one.
 #
-# Bump this and the submodule together; the floor check below catches the case
-# where they disagree in the direction that matters.
-set(SURREALDB_C_GIT_TAG "ba81964cdfa5209c7c102cb3893a65c68e3ac09f"
+# Bump this and the submodule together. Nothing catches it if you do not: the
+# submodule pointer governs a recursive clone and this governs a non-recursive
+# one, they are two records of the same fact, and `SR_VERSION` cannot tell a
+# stale one from a current one while the anchor is a commit past the last tag.
+# It was left behind once already, at the commit that introduced transactions.
+set(SURREALDB_C_GIT_TAG "67afc3fd4a7c4c53b89e4b67723d1bd5cab11cdb"
     CACHE STRING "Exact ref of surrealdb.c to clone -- a tag or a commit, never a branch.")
 
 set(SURREALDB_C_ORIGIN "")

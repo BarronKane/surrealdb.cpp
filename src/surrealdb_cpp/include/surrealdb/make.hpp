@@ -79,13 +79,76 @@ template <class Container>
 [[nodiscard]] inline owned_value file(const char* bucket, const char* key) {
     return owned_value(::sr_value_file(bucket, key));
 }
-/// A record id, as `table:id`.
+// -- record ids --------------------------------------------------------------
+//
+// A record id key has four shapes, and all four turn up in ordinary use:
+//
+//     CREATE t:abc        -> text      CREATE t:['a', 1]  -> array
+//     CREATE t:1          -> number    CREATE t:{ x: 1 }  -> object
+//
+// `thing_ref` reads all four and dispatches on them; for two releases only the
+// text one could be written. That was not a missing convenience. A key of the
+// wrong shape is a *well-formed* record id that refers to nothing, and the
+// database answers a query against it with zero rows and no error -- so the
+// mistake is silent at every layer. `t:1` and `t:"1"` are different records.
+//
+// Each overload here is named by the shape it writes, so choosing wrongly is a
+// thing you can see at the call site rather than a result set that is quietly
+// empty.
+
+/// A record id with a text key: `table:abc`.
+///
+/// **Not the one to reach for by default.** If the record was created with
+/// `CREATE t:1` its key is a number and this will not find it; see the note
+/// above and `thing(table, std::int64_t)`.
 [[nodiscard]] inline owned_value thing(const char* table_name, const char* id) {
     return owned_value(::sr_value_thing(table_name, id));
 }
 
-/// Wrap an object. The object is copied, so the builder stays usable.
-[[nodiscard]] inline owned_value object(const object_builder& o) {
+/// A record id with a text key, from a `std::string`.
+[[nodiscard]] inline owned_value thing(const char* table_name, const std::string& id) {
+    return thing(table_name, id.c_str());
+}
+
+/// A record id with a numeric key: `table:1`.
+///
+/// A template over the integral types rather than a fixed `std::int64_t`
+/// overload, for the reason `object_builder::set` is one: with `const char*`
+/// also in the set, `thing("t", 0)` would otherwise be ambiguous between a
+/// numeric key and a null string. An exact integral match wins outright.
+template <class T,
+          std::enable_if_t<std::is_integral<T>::value &&
+                               !std::is_same<T, bool>::value,
+                           int> = 0>
+[[nodiscard]] owned_value thing(const char* table_name, T id) {
+    return owned_value(
+        ::sr_value_thing_num(table_name, static_cast<std::int64_t>(id)));
+}
+
+/// A record id with an array key: `table:['a', 1]`.
+///
+/// The key is copied, so whatever produced it stays yours.
+[[nodiscard]] inline owned_value thing(const char* table_name, array_arg id) {
+    return owned_value(::sr_value_thing_arr(table_name, id.raw()));
+}
+
+/// A record id with an object key: `table:{ x: 1 }`.
+///
+/// The key is copied. Takes anything an object reaches this library as --
+/// including the `object_view` off a `thing_ref::as_object()`, which is how a
+/// composite id read out of a result gets echoed back.
+[[nodiscard]] inline owned_value thing(const char* table_name, object_arg id) {
+    return owned_value(::sr_value_thing_obj(table_name, id.raw()));
+}
+
+/// Wrap an object. The object is copied, so the source stays usable.
+///
+/// Takes an `object_arg`, so a builder, a view, an `owned_object` off
+/// `create()`, or a raw `const sr_object_t*` all work -- the three-overload
+/// shape `array()` and `set()` have had since 0.2.3, which objects lacked. A
+/// library whose most common return type could not be fed back into its own
+/// inputs is one you can only read out of.
+[[nodiscard]] inline owned_value object(object_arg o) {
     return owned_value(::sr_value_object(o.raw()));
 }
 
@@ -103,19 +166,15 @@ template <class Container>
 /// binding exists to avoid. `sr_value_array` now mirrors `sr_value_object`.
 ///
 /// The array is copied, so the builder stays yours and stays usable.
-[[nodiscard]] inline owned_value array(const sr_array_t* arr) {
-    return owned_value(::sr_value_array(arr));
+[[nodiscard]] inline owned_value array(array_arg arr) {
+    return owned_value(::sr_value_array(arr.raw()));
 }
-[[nodiscard]] inline owned_value array(const array_builder& b) { return array(b.raw()); }
-[[nodiscard]] inline owned_value array(const owned_array& a) { return array(a.get()); }
 
 /// A set value with contents. Duplicates are discarded when it reaches the
 /// database, which is what makes it different from an array.
-[[nodiscard]] inline owned_value set(const sr_array_t* arr) {
-    return owned_value(::sr_value_set(arr));
+[[nodiscard]] inline owned_value set(array_arg arr) {
+    return owned_value(::sr_value_set(arr.raw()));
 }
-[[nodiscard]] inline owned_value set(const array_builder& b) { return set(b.raw()); }
-[[nodiscard]] inline owned_value set(const owned_array& a) { return set(a.get()); }
 
 // -- geometry ----------------------------------------------------------------
 

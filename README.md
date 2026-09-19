@@ -61,6 +61,38 @@ semicolon cannot change the shape of the statement. Identifiers cannot be bound 
 SurrealQL takes them as syntax — so they are validated instead and a bad one
 fails the build rather than reaching the server.
 
+### Reading, changing, writing back
+
+A record you read comes back as an `object_view`, which is read-only. To change
+a field and send it back, copy it into a builder:
+
+```cpp
+auto made = db.create("person:ada", seed);
+object_builder edited{view(made.value())};    // every field, `id` included
+edited.set("age", 37);
+auto r = db.update("person:ada", edited);
+```
+
+The copy is `O(n)` and allocates, where `array_builder(array_view)` is one bulk
+copy — objects are opaque on the C side, so the keys have to be enumerated and
+each value looked up. It needs **surrealdb.c 0.3.2 or newer** for
+`sr_object_from_entries`, which at least makes the write half one call.
+
+Every entry point that takes object content — `create`, `update`, `merge`,
+`insert`, `relate`, query variables, auth params — accepts any of the shapes an
+object arrives as, so nothing has to be rebuilt just to change its type:
+
+```cpp
+db.query("RETURN $n + 1", vars);          // a builder
+db.query("RETURN $n + 1", &vars);         // a pointer to one
+db.query("RETURN $n + 1", vars.view());   // a borrowed view
+db.query("RETURN 1");                     // nothing at all
+```
+
+`make::object` takes the same set, which is what keeps an `owned_object` off
+`create()` from being a dead end. `array_arg` does the same job for arrays,
+including the `array_view` off a query result.
+
 ### Building arrays
 
 ```cpp
@@ -401,10 +433,27 @@ if (t) {
 }
 ```
 
-One asymmetry worth knowing: `make::thing` builds only text ids, and
-`make::polygon` builds only a single ring. For a numeric or composite id, bind
-the parts and let the server assemble it — `type::record($tb, $id)` — which
-keeps the value out of the query text.
+`make::thing` writes all four, one overload per shape:
+
+```cpp
+make::thing("k", "abc");        // k:abc
+make::thing("k", 1);            // k:1
+
+array_builder key; key.push("a").push(1);
+make::thing("k", key);          // k:['a', 1]
+
+object_builder composite; composite.set("x", 1);
+make::thing("k", composite);    // k:{ x: 1 }
+```
+
+**Pick the one the record was created with.** A key of the wrong shape is a
+well-formed record id that matches nothing, and the database answers a query
+against it with zero rows and no error — `k:1` and `k:"1"` are different
+records, and nothing anywhere tells you which one you asked for. That silence
+is why there is an overload per shape rather than a string and a cast.
+
+`make::polygon` still builds only a single ring; for a polygon with holes, bind
+the rings and let the server assemble it.
 
 Everything here is a **view** into the value it came from. The value has to
 outlive it, the same rule as `array_view`.
@@ -916,6 +965,13 @@ rather than through a generator.
   `detail/c_api.hpp` that fires wherever the headers come from. Building against
   an older copy fails with a sentence rather than an undeclared identifier
   halfway down a header you did not write.
+
+  While the anchor is a commit rather than a tag, that floor is loose: the
+  functions this library needs landed *after* 0.3.2, so `SR_VERSION` reads
+  0.3.2 on a checkout that has them and on one that does not. The submodule
+  pointer and `SURREALDB_C_GIT_TAG` are the real pin until there is a release to
+  name; `detail/c_api.hpp` names each required symbol so a stale checkout at
+  least fails at the top of the dependency rather than in the middle of it.
 - A **Rust toolchain** (`cargo`), unless surrealdb.c is already installed. The C
   SDK is a Rust staticlib and is built from source; `find_package(surrealdb_c)`
   finding an installed one is what lets you skip this.

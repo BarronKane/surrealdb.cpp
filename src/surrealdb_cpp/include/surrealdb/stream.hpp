@@ -70,6 +70,7 @@
 #include "poll.hpp"
 #include "value.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <iterator>
@@ -221,6 +222,7 @@ public:
 
         failed_ = true;
         failure_ = error(static_cast<error_code>(rc), owned_string());
+        if (failure_.is_fatal()) poison();
         return error(static_cast<error_code>(rc), owned_string());
     }
 
@@ -417,15 +419,32 @@ private:
 
         failed_ = true;
         failure_ = error(static_cast<error_code>(rc), owned_string());
+        if (failure_.is_fatal()) poison();
         return error(static_cast<error_code>(rc), owned_string());
     }
 
+    /// Latch the *connection's* poison flag on a fatal read.
+    ///
+    /// A stream is the one place `SR_FATAL` is observed away from the handle
+    /// that can report it, and until this existed it was observed and then
+    /// dropped: the subscription died, the connection went on claiming to be
+    /// healthy, and nothing tied the two together. `SR_FATAL` means the engine
+    /// is gone, so it is exactly as true of the connection as of the read that
+    /// saw it.
+    void poison() noexcept {
+        if (poisoned_) poisoned_->store(true, std::memory_order_release);
+    }
+
     friend class connection;
-    stream(sr_stream_t* raw, std::weak_ptr<const void> alive) noexcept
-        : handle_(raw), alive_(std::move(alive)) {}
+    stream(sr_stream_t* raw, std::weak_ptr<const void> alive,
+           std::shared_ptr<std::atomic<bool>> poisoned) noexcept
+        : handle_(raw), alive_(std::move(alive)), poisoned_(std::move(poisoned)) {}
 
     owned_stream handle_;
     std::weak_ptr<const void> alive_;
+
+    /// Shared with the connection this came from; see `poison()`.
+    std::shared_ptr<std::atomic<bool>> poisoned_;
 
     /// Copied out of the first notification; see `query_id()`.
     std::uint8_t query_id_[16]{};

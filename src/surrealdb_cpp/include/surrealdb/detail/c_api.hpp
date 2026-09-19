@@ -53,13 +53,13 @@ extern "C" {
 // Minimum surrealdb.c
 // ---------------------------------------------------------------------------
 //
-// This library calls functions that do not exist in every release -- 0.1.4
-// needs `sr_session_fork`, `sr_runtime_init`, `sr_rpc_kill_on` and the
-// transaction handle API --
-// and building against an older header does not fail anywhere useful. It fails
-// as an undeclared identifier partway down a header the user did not write, or,
-// if the declaration happens to exist but the symbol does not, at the link with
-// a mangled name and no hint about which half is stale.
+// This library calls functions that do not exist in every release -- it needs
+// `sr_session_fork`, `sr_runtime_init`, `sr_rpc_kill_on`, the transaction
+// handle API, `sr_object_from_entries` and the three non-text record id
+// constructors -- and building against an older header does not fail anywhere
+// useful. It fails as an undeclared identifier partway down a header the user
+// did not write, or, if the declaration happens to exist but the symbol does
+// not, at the link with a mangled name and no hint about which half is stale.
 //
 // The floor matters more than usual across 0.3.x, because those releases
 // *reassigned*, *withdrew* and *renamed* rather than only adding. Zero meant
@@ -87,6 +87,33 @@ static_assert(SR_VERSION >= SR_VERSION_ENCODE(SURREALDB_CPP_REQUIRES_C_MAJOR,
               "surrealdb.cpp requires surrealdb.c v0.3.2 or newer "
               "(SR_VERSION_STRING reports what was actually found). Update the "
               "surrealdb.c submodule, or point SURREALDB_C_ROOT at a newer one.");
+
+// **The floor above is a floor, and right now it is not a tight one.**
+//
+// The anchored surrealdb.c is a development commit *past* 0.3.2 -- the
+// transaction handle API and the record id constructors landed after the tag
+// and there is nothing newer to name. So `SR_VERSION` still reports 0.3.2 on a
+// checkout that has them and on one that does not, and the assertion above
+// cannot tell those apart. It will be able to at the next release; until then
+// the submodule pointer, and `SURREALDB_C_GIT_TAG` in
+// cmake/Findsurrealdb_c.cmake, are what actually pin this.
+//
+// What the declarations below buy in the meantime is *location*. Taking an
+// address forces each one to have been declared, here, under the comment that
+// explains what it means -- rather than as an undeclared identifier several
+// hundred lines into make.hpp, where the reader has no reason to suspect their
+// dependency. They are otherwise inert and cost nothing at runtime.
+namespace surrealdb::detail {
+inline constexpr bool c_api_is_new_enough =
+    sizeof(&::sr_begin) + sizeof(&::sr_tx_query) + sizeof(&::sr_commit) +
+    sizeof(&::sr_cancel) + sizeof(&::sr_session_fork) + sizeof(&::sr_runtime_init) +
+    sizeof(&::sr_rpc_kill_on) + sizeof(&::sr_object_from_entries) +
+    sizeof(&::sr_value_thing_num) + sizeof(&::sr_value_thing_arr) +
+    sizeof(&::sr_value_thing_obj) > 0;
+static_assert(c_api_is_new_enough,
+              "surrealdb.c is older than the commit surrealdb.cpp is anchored "
+              "to. Update the submodule.");
+} // namespace surrealdb::detail
 
 // ---------------------------------------------------------------------------
 // Capabilities of the C, as opposed to capabilities of the standard

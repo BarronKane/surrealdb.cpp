@@ -9,6 +9,7 @@
 #include "detail/owned.hpp"
 #include "value.hpp"
 
+#include <cstddef>
 #include <string>
 #include <vector>
 #include <type_traits>
@@ -181,6 +182,41 @@ private:
     }
 
     owned_array arr_;
+};
+
+/// An array argument: anything the C can read as one.
+///
+/// The counterpart to `object_arg`. Unlike that one this cannot be a bare
+/// pointer: an `array_view` is a `(ptr, len)` pair with no `sr_array_t` behind
+/// it to point at, so the two-word header is carried here by value and `raw()`
+/// hands back its own address. That makes the class self-contained under copy,
+/// which matters because it is passed by value.
+class array_arg {
+public:
+    /// No array. What an omitted argument list means.
+    array_arg() noexcept = default;
+    array_arg(std::nullptr_t) noexcept {}
+
+    array_arg(const array_builder& b) noexcept : array_arg(b.raw()) {}
+    array_arg(const owned_array& a) noexcept : array_arg(a.get()) {}
+    array_arg(array_view v) noexcept
+        // `sr_array_t::arr` is not const-qualified, and the constructors this
+        // feeds only ever read it -- they deep-copy. The cast buys the view
+        // its way into a C struct that predates the read/write split.
+        : block_{const_cast<sr_value_t*>(v.data()), v.size()}, have_(true) {}
+    array_arg(const sr_array_t* a) noexcept
+        : block_(a ? *a : sr_array_t{nullptr, 0}), have_(a != nullptr) {}
+
+    /// Null when there is no array at all, which is distinct from an array
+    /// that is present and empty -- the C tells those apart.
+    [[nodiscard]] const sr_array_t* raw() const noexcept {
+        return have_ ? &block_ : nullptr;
+    }
+    [[nodiscard]] bool valid() const noexcept { return have_; }
+
+private:
+    sr_array_t block_{nullptr, 0};
+    bool have_{false};
 };
 
 } // namespace surrealdb

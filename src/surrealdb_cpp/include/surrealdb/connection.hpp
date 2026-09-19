@@ -120,8 +120,24 @@ public:
     /// lands in that statement's slot and the choice of what to do next is
     /// yours: carry on, or `cancel()`. That choice is the reason this is a
     /// handle and not one big query string.
+    ///
+    /// **This is the only way statements get into a transaction**, and the
+    /// asymmetry with `connection::create` and friends is deliberate on both
+    /// sides of the boundary. `sr_tx_query` is the C's only transaction entry
+    /// point, and its documentation says the typed variants are better answered
+    /// a level up -- here. They are not offered here either, and the reason is
+    /// the paragraph above rather than effort: `db.create()` returns
+    /// `result<owned_object>`, folding a statement failure into the result,
+    /// because on a connection there is nothing else it could mean. In a
+    /// transaction a failed statement is a *decision point*, not a failed call,
+    /// so a `tx.create()` of the same shape would have to throw away the thing
+    /// this class exists to preserve, and one of a different shape would not be
+    /// the symmetry anyone came for.
+    ///
+    /// That is the trade to reopen if it ever needs reopening. `single()` on
+    /// the results is the fold, for a caller who wants it per statement.
     [[nodiscard]] result<query_results> query(
-            const char* surql, const object_builder* vars = nullptr) noexcept {
+            const char* surql, object_arg vars = {}) noexcept {
         if (handle_ == nullptr)
             return error::local(error_code::error,
                                 "query() on a transaction that was already "
@@ -138,10 +154,30 @@ public:
         return track(detail::invoke<query_results>(
             [&](sr_string_t* e) {
                 return ::sr_tx_query(handle_, e, &out, surql,
-                                     vars ? vars->raw() : nullptr);
+                                     vars.raw());
             },
             [&](int n) { return query_results(owned_arr_results(out, n)); }));
     }
+
+    // -- why there is no `raw()` here -----------------------------------------
+    //
+    // `connection`, `rpc`, `session_id` and `notification` all expose their C
+    // pointer, and the absence of one here reads like the newest class simply
+    // missing the convention. It is not.
+    //
+    // Those four hand out a pointer that ordinary use only ever reads --
+    // `connection::raw()` is a `const sr_surreal_t*`, and no C call reachable
+    // through it frees the handle. A transaction handle is *consumed*:
+    // `sr_commit` and `sr_cancel` each take it and destroy it. `sr_tx_query`
+    // needs it non-const, so there is no const-qualified spelling that lends
+    // out the query half without lending out the destroying half, and a caller
+    // who reached for `sr_commit(tx.raw(), &e)` would get a double free at the
+    // next scope exit -- from a class whose whole point is that scope exit is
+    // correct.
+    //
+    // The need an escape hatch existed for here is gone anyway: binding a
+    // borrowed object as a query variable is what `object_arg` does, so
+    // `query()` reaches everything `sr_tx_query` does.
 
     /// Commit, making everything visible together. Consumes the transaction.
     [[nodiscard]] result<void> commit() noexcept { return finish(&::sr_commit, "commit"); }
@@ -240,8 +276,12 @@ public:
     /// Shared with every handle forked from this one, and with the one it was
     /// forked from: `SR_FATAL` means the engine itself is gone, so a sibling
     /// reporting healthy would be lying.
+    /// Safe on a moved-from handle, which is the reason for the branch: the
+    /// flag is a shared pointer and moving hands it away, so an unguarded load
+    /// would be a null dereference on a query that is otherwise harmless to
+    /// ask. A handle with no flag has seen nothing.
     [[nodiscard]] bool poisoned() const noexcept {
-        return poisoned_->load(std::memory_order_acquire);
+        return poisoned_ && poisoned_->load(std::memory_order_acquire);
     }
 
     /// Close early. The destructor does this anyway.
@@ -338,7 +378,7 @@ public:
     /// alone and ignore it.
     [[nodiscard]] result<owned_string> signin(scope level, credentials creds,
                                               const access* details = nullptr,
-                                              const object_builder* params = nullptr) noexcept {
+                                              object_arg params = {}) noexcept {
         return auth_call(&::sr_signin, level, creds, details, params);
     }
 
@@ -347,8 +387,8 @@ public:
     /// The spelling the call usually wants: an access method plus a bag of
     /// fields, with no separate credentials.
     [[nodiscard]] result<owned_string> signin(const access& details,
-                                              const object_builder& params) noexcept {
-        return auth_call(&::sr_signin, scope::record, credentials{}, &details, &params);
+                                              object_arg params) noexcept {
+        return auth_call(&::sr_signin, scope::record, credentials{}, &details, params);
     }
 
     /// Sign up and return the token.
@@ -358,14 +398,14 @@ public:
     /// to arrive here.
     [[nodiscard]] result<owned_string> signup(scope level, credentials creds,
                                               const access* details = nullptr,
-                                              const object_builder* params = nullptr) noexcept {
+                                              object_arg params = {}) noexcept {
         return auth_call(&::sr_signup, level, creds, details, params);
     }
 
     /// Sign up at record level with the fields the SIGNUP query reads.
     [[nodiscard]] result<owned_string> signup(const access& details,
-                                              const object_builder& params) noexcept {
-        return auth_call(&::sr_signup, scope::record, credentials{}, &details, &params);
+                                              object_arg params) noexcept {
+        return auth_call(&::sr_signup, scope::record, credentials{}, &details, params);
     }
 
     [[nodiscard]] result<void> authenticate(const char* token) noexcept {
@@ -393,7 +433,7 @@ public:
     /// Create a record. The created record is returned; pass nothing to
     /// discard it, which avoids the server building one.
     [[nodiscard]] result<owned_object> create(const char* resource,
-                                              const object_builder& content) noexcept {
+                                              object_arg content) noexcept {
         sr_object_t made{};
         return track(detail::invoke<owned_object>(
             [&](sr_string_t* e) {
@@ -403,32 +443,32 @@ public:
     }
 
     [[nodiscard]] result<void> create_discarding(const char* resource,
-                                                 const object_builder& content) noexcept {
+                                                 object_arg content) noexcept {
         return track(detail::invoke([&](sr_string_t* e) {
             return ::sr_create(raw(), e, nullptr, resource, content.raw());
         }));
     }
 
     [[nodiscard]] result<owned_values> update(const char* resource,
-                                              const object_builder& content) noexcept {
+                                              object_arg content) noexcept {
         return content_call(&::sr_update, resource, content);
     }
     [[nodiscard]] result<owned_values> upsert(const char* resource,
-                                              const object_builder& content) noexcept {
+                                              object_arg content) noexcept {
         return content_call(&::sr_upsert, resource, content);
     }
     [[nodiscard]] result<owned_values> merge(const char* resource,
-                                             const object_builder& content) noexcept {
+                                             object_arg content) noexcept {
         return content_call(&::sr_merge, resource, content);
     }
     [[nodiscard]] result<owned_values> insert(const char* resource,
-                                              const object_builder& content) noexcept {
+                                              object_arg content) noexcept {
         return content_call(&::sr_insert, resource, content);
     }
 
     [[nodiscard]] result<owned_values> relate(const char* from, const char* relation,
                                               const char* to,
-                                              const object_builder& content) noexcept {
+                                              object_arg content) noexcept {
         sr_value_t* out = nullptr;
         return track(detail::invoke<owned_values>(
             [&](sr_string_t* e) {
@@ -443,7 +483,7 @@ public:
     /// a content object that already carries `in` and `out`, which is the
     /// shape you get back from a query.
     [[nodiscard]] result<owned_values> insert_relation(
-        const char* table, const object_builder& content) noexcept {
+        const char* table, object_arg content) noexcept {
         return content_call(&::sr_insert_relation, table, content);
     }
 
@@ -453,7 +493,7 @@ public:
     /// executes a built query. A scalar result comes back as a one-element
     /// array.
     [[nodiscard]] result<owned_values> call(const char* function_name,
-                                            const array_builder& args) noexcept {
+                                            array_arg args) noexcept {
         sr_value_t* out = nullptr;
         return track(detail::invoke<owned_values>(
             [&](sr_string_t* e) {
@@ -517,11 +557,11 @@ public:
     /// fail this call -- see `query_results` and `statement_result`, and reach
     /// for `single()` when there is only one statement.
     [[nodiscard]] result<query_results> query(
-        const char* surql, const object_builder* vars = nullptr) noexcept {
+        const char* surql, object_arg vars = {}) noexcept {
         sr_arr_res_t* out = nullptr;
         return track(detail::invoke<query_results>(
             [&](sr_string_t* e) {
-                return ::sr_query(raw(), e, &out, surql, vars ? vars->raw() : nullptr);
+                return ::sr_query(raw(), e, &out, surql, vars.raw());
             },
             [&](int n) { return query_results(owned_arr_results(out, n)); }));
     }
@@ -539,7 +579,9 @@ public:
         sr_stream_t* out = nullptr;
         return track(detail::invoke<stream>(
             [&](sr_string_t* e) { return ::sr_select_live(raw(), e, &out, resource); },
-            [&](int) { return stream(out, std::weak_ptr<const void>(alive_)); }));
+            [&](int) {
+                return stream(out, std::weak_ptr<const void>(alive_), poisoned_);
+            }));
     }
 
     /// Kill a live query by its id, as reported by `notification::query_id`.
@@ -674,7 +716,7 @@ private:
     /// Latch the poison flag from any result that reports SR_FATAL.
     template <class T>
     result<T> track(result<T> r) noexcept {
-        if (!r.has_value() && r.error().is_fatal())
+        if (!r.has_value() && r.error().is_fatal() && poisoned_)
             poisoned_->store(true, std::memory_order_release);
         return r;
     }
@@ -701,7 +743,7 @@ private:
     }
 
     result<owned_values> content_call(content_fn fn, const char* resource,
-                                      const object_builder& content) noexcept {
+                                      object_arg content) noexcept {
         sr_value_t* out = nullptr;
         return track(detail::invoke<owned_values>(
             [&](sr_string_t* e) { return fn(raw(), e, &out, resource, content.raw()); },
@@ -713,7 +755,7 @@ private:
                             const sr_credentials_access*, const sr_object_t*);
     result<owned_string> auth_call(auth_fn fn, scope level, credentials creds,
                                    const access* details,
-                                   const object_builder* params) noexcept {
+                                   object_arg params) noexcept {
         const sr_credentials_scope c_scope = static_cast<sr_credentials_scope>(level);
         // sr_string_t is char*, so the C structs take non-const pointers even
         // though nothing is written through them.
@@ -730,7 +772,7 @@ private:
             [&](sr_string_t* e) {
                 return fn(raw(), e, &token, &c_scope, &c_creds,
                           details ? &c_access : nullptr,
-                          params ? params->raw() : nullptr);
+                          params.raw());
             },
             [&](int) { return owned_string(token); }));
     }
