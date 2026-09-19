@@ -468,16 +468,18 @@ void test_destructor_retires_the_query() {
     CHECK(after == 0);
 }
 
-// The hole that cannot be closed from here.
+// A stream that never fired is still retired by close().
 //
-// `sr_select_live` returns a stream and not an id, and the SDK keeps its copy
-// private, so a live query that has never fired has no id anyone can name --
-// there is nothing to pass to `sr_kill`. It goes when the connection does.
+// This used to be the hole. `sr_select_live` hands back a stream and no id, so
+// a live query that never delivered a notification had no id anyone could name
+// and could not be killed -- and `sr_stream_kill` freed the reader while
+// leaving the subscription registered. The pair of calls was mandatory and one
+// of them was impossible.
 //
-// Pinned so the limitation is visible rather than folklore, and so that a C API
-// that later hands back the id at creation shows up here as a failure.
-void test_unread_stream_cannot_be_retired() {
-    std::printf("timeout: an unread stream cannot be retired\n");
+// `sr_stream_kill` retires the subscription itself now, and needs no id, so the
+// case that could not be handled is the ordinary one.
+void test_unread_stream_is_still_retired() {
+    std::printf("timeout: an unread stream is retired too\n");
     auto db = open();
     if (!db.valid()) { std::printf("  no connection; skipped\n"); return; }
     (void)db.query("DEFINE TABLE p13_unread SCHEMALESS");
@@ -488,19 +490,17 @@ void test_unread_stream_cannot_be_retired() {
         if (!s.has_value()) { std::printf("  live unavailable; skipped\n"); return; }
         auto stream = std::move(s).value();
         CHECK(live_count(db, "p13_unread") == 1);
-        // Never read, so never learned its id.
+        // Never read, so it never learned an id -- and no longer needs one.
         CHECK(!stream.query_id().has_value());
         stream.close();
     }
 
     int after = live_count(db, "p13_unread");
-    for (int i = 0; i < 10 && after != 0; ++i) {
+    for (int i = 0; i < 20 && after != 0; ++i) {
         (void)db.query("RETURN 1");
         after = live_count(db, "p13_unread");
     }
-    CHECK(after == 1);
-    if (after == 0)
-        std::printf("  the id is now reachable without reading; revisit close()\n");
+    CHECK(after == 0);
 }
 
 // An explicit kill still works, and repeating it is harmless.
@@ -536,21 +536,19 @@ void test_explicit_kill_then_close() {
     CHECK(after == 0);
 }
 
-// KILL stops delivery, and does *not* end the stream.
+// KILL stops delivery *and* ends the stream.
 //
-// Both halves are asserted because both are load-bearing. The first is what
-// makes a correct query_id observable end-to-end. The second is the upstream
-// core defect that surrealdb.c 0.3.1 documents and works around: nothing on the
-// database side ends an `sr_stream_t` -- not KILL, not REMOVE
-// TABLE/DATABASE/NAMESPACE -- which is why the unbounded read was withdrawn
-// entirely. The bounded reader must keep reporting `timed_out` rather than
-// inventing an end or a failure.
+// Both halves are asserted because both were broken. Delivery stopping is what
+// makes a correct query_id observable end to end. The stream ending is the
+// upstream fix: `KILL` used to build its terminal notification with the session
+// id unset, and the embedded router dropped exactly that shape, so a killed
+// stream went quiet and stayed open forever. That is what made the unbounded
+// read unusable, and fixing it is what brought `next()` back.
 //
-// When the upstream fix lands this starts failing on `!ended`, which is the
-// right way to find out. `stream::close()` is the supported way to retire one
-// of these in the meantime.
-void test_kill_stops_delivery() {
-    std::printf("timeout: KILL stops delivery\n");
+// The reader here is still bounded, because a test that can hang is worse than
+// one that fails.
+void test_kill_ends_the_stream() {
+    std::printf("timeout: KILL ends the stream\n");
     auto db = open();
     if (!db.valid()) { std::printf("  no connection; skipped\n"); return; }
 
@@ -559,63 +557,47 @@ void test_kill_stops_delivery() {
     auto stream = std::move(s).value();
 
     touch(db, "p13_kill:a");
+    const std::string id = query_id_of(stream);
+    if (id.empty()) { std::printf("  no notification; skipped\n"); return; }
 
-    std::string query_id;
-    for (int i = 0; i < 60 && query_id.empty(); ++i) {
-        auto p = stream.next_for(50ms);
-        if (!p.has_value()) return;
-        if (p.value().timed_out()) continue;
-        if (p.value().ended()) break;
-        auto n = p.value().take();
-        if (!n.has_value()) break;
-        static const char* hex = "0123456789abcdef";
-        const std::uint8_t* b = n.value().query_id().bytes;
-        for (int j = 0; j < 16; ++j) {
-            if (j == 4 || j == 6 || j == 8 || j == 10) query_id.push_back('-');
-            query_id.push_back(hex[(b[j] >> 4) & 0xF]);
-            query_id.push_back(hex[b[j] & 0xF]);
-        }
-    }
-    if (query_id.empty()) { std::printf("  no notification; skipped\n"); return; }
-
-    auto killed = db.kill(query_id.c_str());
+    auto killed = db.kill(id.c_str());
     CHECK(killed.has_value());
-    if (!killed.has_value()) return;
-
-    // Drain anything already queued from before the kill.
-    for (int i = 0; i < 10; ++i) {
-        auto p = stream.try_next();
-        if (!p.has_value() || !p.value().ready()) break;
-        (void)p.value().take();
+    if (!killed.has_value()) {
+        std::printf("  kill failed: %.*s\n",
+                    static_cast<int>(killed.error().message().size()),
+                    killed.error().message().data());
+        return;
     }
 
-    // Nothing written after a successful KILL may be delivered.
-    touch(db, "p13_kill:b");
-    touch(db, "p13_kill:c");
-
-    int delivered = 0;
+    // The stream must report its end rather than going quiet. A `killed`
+    // notification may arrive first; either way the end has to follow.
     bool ended = false;
-    for (int i = 0; i < 20; ++i) {
+    bool saw_killed = false;
+    int delivered_after = 0;
+    for (int i = 0; i < 60 && !ended; ++i) {
         auto p = stream.next_for(50ms);
-        CHECK(p.has_value());
+        CHECK(p.has_value());               // an end is not an error
         if (!p.has_value()) return;
         if (p.value().ended()) { ended = true; break; }
         if (p.value().timed_out()) continue;
-        ++delivered;
-        (void)p.value().take();
+        auto n = p.value().take();
+        if (n.has_value() && n.value().action() == sdb::action::killed) saw_killed = true;
+        else ++delivered_after;
     }
 
-    CHECK(delivered == 0);            // the kill took effect
-    CHECK(!ended);                    // ...but the stream is still open
-    CHECK(!stream.done());
-    CHECK(stream.failure() == nullptr);
+    CHECK(ended);
+    CHECK(stream.done());
+    CHECK(stream.failure() == nullptr);      // ended, not failed
+    CHECK(delivered_after == 0);             // the kill took effect
+    std::printf("  (killed notification seen: %s)\n", saw_killed ? "yes" : "no");
 }
 
-// The end of a stream as the C actually reports it.
+// The other reachable SR_CLOSED: an rpc_stream outliving its context.
 //
-// This is the only reachable SR_CLOSED in the library: an `sr_stream_t` cannot
-// be ended from the database side at all, but an `rpc_stream` outlives the
-// context it came from and reports the end once that context is gone.
+// This was the *only* one while a killed `sr_stream_t` stayed open forever.
+// `test_kill_ends_the_stream` now covers the other route, and this still earns
+// its place because the mechanism is different -- the RPC path ends when the
+// context that feeds it is destroyed, not when the query is killed.
 //
 // Worth reaching, because 0.3.0 moved this code. `sr_stream_next` reported the
 // end as SR_AGAIN (0) in 0.2.x and reports it as SR_CLOSED (-1) now, so a reader
@@ -812,10 +794,10 @@ int main() {
     test_next_for_receives();
     test_timeout_then_event();
     test_notification_query_id();
-    test_kill_stops_delivery();
+    test_kill_ends_the_stream();
     test_close_retires_the_query();
     test_destructor_retires_the_query();
-    test_unread_stream_cannot_be_retired();
+    test_unread_stream_is_still_retired();
     test_explicit_kill_then_close();
     test_rpc_stream_ends_on_teardown();
     test_negative_duration_is_not_sent();

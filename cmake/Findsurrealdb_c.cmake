@@ -48,18 +48,23 @@ set(SURREALDB_C_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/../surrealdb.c"
     CACHE PATH "Path to the surrealdb.c source checkout")
 set(SURREALDB_C_GIT_REPOSITORY "https://github.com/BarronKane/surrealdb.c.git"
     CACHE STRING "Repository to clone surrealdb.c from")
-# A tag, not a branch.
+# An exact ref, never a branch.
 #
-# This used to default to `main-standardization`, which meant a non-recursive
-# clone of surrealdb.cpp fetched whatever that branch happened to point at --
-# so two people building the same surrealdb.cpp commit could get different C
-# libraries, and neither would match the submodule pointer this repository
-# actually pins. A tag makes the fetch path reproduce the submodule path.
+# This used to default to a branch name, which meant a non-recursive clone
+# fetched whatever that branch happened to point at -- so two people building
+# the same surrealdb.cpp commit could get different C libraries, and neither
+# would match the submodule pointer this repository pins. An exact ref makes
+# the fetch path reproduce the submodule path.
+#
+# A commit rather than a tag right now: the anchor is a development commit on
+# surrealdb.c's `0.3-dev`, which in turn points its own dependency at a fork of
+# SurrealDB carrying live-query fixes that are still an open PR upstream. There
+# is no tag to name yet. Move this back to a tag when there is one.
 #
 # Bump this and the submodule together; the floor check below catches the case
 # where they disagree in the direction that matters.
-set(SURREALDB_C_GIT_TAG "v0.3.2"
-    CACHE STRING "Ref of surrealdb.c to clone. Prefer a tag over a branch.")
+set(SURREALDB_C_GIT_TAG "ba81964cdfa5209c7c102cb3893a65c68e3ac09f"
+    CACHE STRING "Exact ref of surrealdb.c to clone -- a tag or a commit, never a branch.")
 
 set(SURREALDB_C_ORIGIN "")
 

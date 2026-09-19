@@ -250,9 +250,10 @@ void probe_connection() {
         s.close();
     }
 
-    auto tx = db.begin();
-    expect(tx.has_value(), "begin");
-    if (tx) { sdb::transaction t = std::move(tx).value(); expect(t.cancel().has_value(), "cancel"); }
+    // Transactions have to share one query -- connection::begin() is
+    // deleted, because sr_begin closes its transaction with its own call.
+    expect(db.query("BEGIN; CREATE probe_tx:a SET v = 1; CANCEL;").has_value(),
+           "transaction in one query");
 }
 
 void probe_rpc() {
@@ -290,7 +291,13 @@ void probe_rpc() {
         ro.kvs_threadpool_size(0);          // a no-op value, so ordering is moot
         (void)ro.to_c();
         expect(sdb::c_version >= sdb::required_c_version, "c version floor");
-        expect(!sdb::has_unbounded_stream_read, "unbounded read withheld");
+        // Not pinned to a value -- it tracks the anchored dependency. What is
+        // pinned is that the constant and the macro agree, so a module
+        // consumer reading the constant is told the same thing as a header
+        // consumer reading the macro.
+        expect(sdb::has_unbounded_stream_read ==
+               (SURREALDB_HAS_UNBOUNDED_STREAM_READ != 0),
+               "unbounded read flag mirrors its macro");
     }
 
     // Typed queries on a session -- 0.3.0's sr_rpc_query_on.

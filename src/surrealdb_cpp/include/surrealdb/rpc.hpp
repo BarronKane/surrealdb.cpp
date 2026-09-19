@@ -393,6 +393,10 @@ public:
 
     /// Send an encoded request on this context's own session.
     ///
+    /// A `kill` request sent this way keeps the registry exact -- the method
+    /// carries the id in its parameters. A `query` request whose text is a
+    /// `KILL` does not; see `kill_on()`.
+    ///
     /// `request` is CBOR; so is the reply. Nothing here inspects either.
     ///
     /// **A successful result does not mean the query succeeded.** There are two
@@ -462,6 +466,12 @@ public:
     /// passing none is distinct from passing an empty object -- the C omits the
     /// parameter entirely rather than sending an empty map, because core
     /// distinguishes the two when validating params.
+    ///
+    /// **A `KILL` written into this query text leaves a stale registry entry.**
+    /// The kill itself lands, but this context cannot learn which id it was --
+    /// `KILL` resolves to `NONE`, so core never reports it to the transport --
+    /// and the entry survives until the session is torn down. `kill_on()` is
+    /// the route that keeps the registry exact.
     [[nodiscard]] result<query_results> query_on(
             const session_id& session, const char* surql,
             const object_builder* vars = nullptr) noexcept {
@@ -472,6 +482,32 @@ public:
                                          vars ? vars->raw() : nullptr);
             },
             [&](int n) { return query_results(owned_arr_results(out, n)); }));
+    }
+
+    /// Retire a live query on a session, by its id.
+    ///
+    /// **Prefer this over writing `KILL` into query text.** Both retire the
+    /// subscription, so either works on the database -- the difference is
+    /// bookkeeping this context cannot do for you otherwise.
+    ///
+    /// An `rpc` keeps a registry of the live queries each session owns, so it
+    /// can retire them when the session is detached, reset or re-authenticated.
+    /// Core only tells a transport about a kill when the response carries a
+    /// uuid, and `KILL` does not produce one -- it resolves to `NONE`, so the
+    /// hook never fires. This call carries the id in its own parameters, so the
+    /// registry stays exact without guessing.
+    ///
+    /// A `KILL` sent as query text through `query_on`, or as a CBOR request
+    /// through `execute`/`execute_on`, still kills: the subscription goes and
+    /// nothing is left running. The registry entry simply survives until the
+    /// session is torn down, costing a little memory and one redundant kill at
+    /// teardown. Documented rather than worked around, because guessing which
+    /// id a statement killed is how you retire the wrong one.
+    [[nodiscard]] result<void> kill_on(const session_id& session,
+                                       const char* query_id) noexcept {
+        return track(detail::invoke([&](sr_string_t* e) {
+            return ::sr_rpc_kill_on(raw(), e, session.raw(), query_id);
+        }));
     }
 
     // -- sessions ------------------------------------------------------------

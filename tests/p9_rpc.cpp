@@ -397,6 +397,21 @@ void test_query_on_session(sdb::rpc& ctx) {
         }
     }
 
+    // kill_on: the typed route that keeps the live-query registry exact.
+    //
+    // A KILL written into query text kills the subscription but leaves the
+    // registry entry, because core only reports a kill to the transport when
+    // the response carries a uuid and KILL resolves to NONE. This call carries
+    // the id in its own parameters instead. Both are accepted here -- what is
+    // checked is that the typed route exists and reports failures rather than
+    // swallowing them.
+    {
+        auto bogus = ctx.kill_on(s1, "00000000-0000-4000-8000-000000000000");
+        // Either outcome is defensible for an id that never existed; what must
+        // not happen is a crash, or a success with an empty message on failure.
+        CHECK(bogus.has_value() || !bogus.error().message().empty());
+    }
+
     CHECK(ctx.detach(s1).has_value());
     CHECK(ctx.detach(s2).has_value());
 }

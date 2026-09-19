@@ -116,22 +116,20 @@ int main() {
     }
 
 #elif SURREALDB_NEG_CASE == 9
-    // The unbounded stream read, withdrawn in surrealdb.c 0.3.1. A reader
-    // parked here on a killed live query could not be released by anything.
-    auto live3 = db.live("t");
-    if (live3) {
-        sdb::stream s = std::move(live3).value();
-        auto n = s.next();
-        (void)n;
-    }
+    // connection::begin(). sr_begin sends its own one-statement query, so the
+    // transaction closes before the next call and nothing after it is scoped --
+    // measured, with every call reporting success. Transactions must share one
+    // query; see the member's note.
+    auto tx = db.begin();
+    (void)tx;
 
-#elif SURREALDB_NEG_CASE == 10
-    // A live stream is not a range: an iterator cannot say "nothing yet".
-    auto live4 = db.live("t");
-    if (live4) {
-        sdb::stream s = std::move(live4).value();
-        for (auto& n : s) (void)n;
-    }
+// Cases 10 and 11 are retired.
+//
+// They guarded `stream::next()` and stream iteration while the unbounded read
+// deadlocked against a killed live query. The anchored surrealdb.c carries the
+// teardown fixes, so both members are back and the cases would now compile --
+// which as WILL_FAIL tests means they would fail. Removed rather than left
+// broken; `SURREALDB_HAS_UNBOUNDED_STREAM_READ` is where that history lives.
 
 #endif
     return 0;

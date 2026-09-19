@@ -185,45 +185,32 @@ at runtime.
 auto s = db.live("person");
 auto stream = std::move(s).value();
 
-for (;;) {
-    auto r = stream.next_for(std::chrono::milliseconds(250));
-    if (!r) break;                          // the stream failed
-
-    auto& p = r.value();
-    if (p.ended()) break;                   // the stream finished
-    if (p.timed_out()) {                    // nothing yet
-        if (shutting_down) break;
-        continue;
-    }
-    auto n = p.take();
-    handle(n->action(), n->data());
+while (auto n = stream.next()) {
+    if (!n.value()) break;              // stream ended
+    handle(n.value()->action(), n.value()->data());
 }
 stream.close();
 ```
 
 Three things about this API are worth knowing before you use it:
 
-- **Every read is bounded, and that is a choice this library is still making.**
-  A reader parked in an unbounded read has no exit — see [Ending a live
-  query](#ending-a-live-query). surrealdb.c withdrew `sr_stream_next` in 0.3.1
-  and restored it in 0.3.2 ahead of the upstream fix, documenting it as the
-  wrong call to reach for meanwhile. This library keeps it `= delete`d, because
-  the symbol came back and the deadlock did not go away, and a compile error
-  that explains itself beats a hung thread. `surrealdb::has_unbounded_stream_read`
-  is the flag to watch; `next()` and range-for return when it flips. A long
-  bound is cheap: the wait is a real timer, so
-  `next_for(std::chrono::hours(1))` costs what blocking for an hour would have
-  cost and still returns.
-- **A live stream is not a range.** An iterator has two answers — here is an
-  element, or the range is over — and a bounded read has three. The third,
-  "nothing yet", has nowhere to go: advancing on it parks forever, ending on it
-  silently truncates a live query at the first quiet moment. So you drive the
-  loop and decide for yourself what a run of timeouts means. `rpc_stream` keeps
-  its iteration, because the RPC path really does end.
+- **`next()` blocks, and a killed query now ends the stream.** That second half
+  was not true until recently: a killed live query stayed open and silent, so a
+  reader parked here could not be released by anything short of ending the
+  process. `next()` and range-for were `= delete`d on that for two releases.
+  They are back — `surrealdb::has_unbounded_stream_read` is the flag, and it
+  tracks the anchored dependency rather than the standard.
+- **`next()` still cannot wake for anything else.** A reader that also has to
+  notice a shutdown flag wants `next_for()` below, because killing the *stream*
+  from another thread frees the very object that reader is borrowing.
 - **Teardown is ordered.** A stream borrows its connection's runtime, so it must
   be destroyed first. Natural scoping already does this; a stream moved
   somewhere longer-lived does not, and the library detects that rather than
   running a kill against a dead runtime.
+
+A range-for works and reads better for a dedicated worker thread, with one
+caveat: it blocks *past* the last event you know about, because the loop
+increments before re-testing its condition. Break from inside the body.
 
 ### Bounded waits
 
@@ -271,50 +258,30 @@ runtime that may already be shut down. Prefer tens of milliseconds over one.
 stream.close();     // retires the subscription and releases the reader
 ```
 
-That is the whole thing, and the destructor calls it, so scope exit is already
-correct.
+One call, no id needed, and the destructor calls it — so scope exit is already
+correct. `connection::kill()` covers the other case: a subscription you have an
+id for and no stream, such as a bare `LIVE SELECT` run through `query()`.
+Calling both is harmless, just unnecessary.
 
-It is worth knowing what that one call is covering for. The C needs **two**:
-`sr_kill` retires the subscription in the datastore, `sr_stream_kill` frees the
-local reader, and neither does the other's job. `sr_stream_kill` does route a
-kill through the SDK, but it is `tokio::spawn`ed with its result discarded and
-observably does not land on SurrealDB 3.2.4 — `INFO FOR TABLE` carries a `lives`
-object, and the count is undiminished afterwards. Two calls that must both
-happen is a rule rather than a type, so `close()` does both and is the only way
-to close a stream.
+Killing a subscription now *tells* any stream reading it: the stream reports its
+end rather than going quiet.
 
-`connection::kill()` is still there for a live query registered *without* a
-stream — a bare `LIVE SELECT` run through `query()`, which answers with the id
-but hands back no reader. Using it on a stream you hold is now redundant rather
-than wrong.
+None of that used to be true, and the history is worth a paragraph because it
+explains the shape of this API. Freeing a reader left the subscription
+registered — `INFO FOR TABLE` carries a `lives` count, and it stayed up — so
+teardown needed both calls. Killing a live query left its stream open and
+silent forever, on every route: not just `KILL` but `REMOVE TABLE`, which no
+caller asked for, so "only block when an event is coming" was not a discipline
+anyone could keep. That is what made the unbounded read unusable.
 
-**One hole cannot be closed from here.** `db.live()` returns a stream and not an
-id, and the SDK keeps its own copy private, so the id is only learnable from the
-first notification — `stream::query_id()` is empty until then. A live query that
-never fires has no id anyone can name, so it cannot be retired; it goes when the
-connection does. The alternative is running `LIVE SELECT` through `query()` to
-get the id, but then there is no stream to read from. Picking one is a real
-limitation of the C API, not a style choice.
-
-### Killing does not end a stream
-
-`kill()` stops delivery but leaves the stream open and silent. Nothing on the
-database side ends one — not `KILL`, not `REMOVE TABLE`, `REMOVE DATABASE` or
-`REMOVE NAMESPACE`.
-
-That is an upstream core defect, and a precise one:
-[surrealdb/surrealdb#7520](https://github.com/surrealdb/surrealdb/pull/7520).
-`KILL` and `REMOVE TABLE` build their terminal notification with the session id
-unset, and the embedded router drops exactly that shape before routing it —
-everything below the gate already works. `REMOVE TABLE` is the worse half,
-because no caller asked for it: an unrelated schema change orphans every stream
-on that table, so "only block when an event is coming" is not a discipline
-anyone can keep. It is also why the unbounded read is withheld here: a reader
-parked on a killed live query has no way out at all. Nothing arrives, the end
-never comes, and killing the stream from another thread frees the very object
-that reader is borrowing.
-
-An `rpc_stream` does report its end, when the context it came from is destroyed.
+Four upstream defects sat behind that, fixed in
+[surrealdb/surrealdb#7527](https://github.com/surrealdb/surrealdb/pull/7527):
+the terminal notification carried no session id so the embedded router dropped
+it; the WebSocket client rejected `KILLED` when decoding it; `Stream::drop`
+built malformed SurrealQL under a blank session so freeing a stream never
+retired anything; and `REMOVE DATABASE`/`REMOVE NAMESPACE` destroyed
+subscriptions without telling them. Until that PR ships, surrealdb.c anchors on
+a fork carrying the fixes — see [Requirements](#requirements).
 
 Sessions are the exception, and they are tidier about it. On an `rpc` context,
 `detach()` and `reset()` both retire the session's live queries — so do the
@@ -442,6 +409,33 @@ keeps the value out of the query text.
 Everything here is a **view** into the value it came from. The value has to
 outlive it, the same rule as `array_view`.
 
+## Transactions
+
+**A transaction has to fit in one query.**
+
+```cpp
+db.query("BEGIN;"
+         "UPDATE account:a SET balance -= 100;"
+         "UPDATE account:b SET balance += 100;"
+         "COMMIT;");
+```
+
+That rolls back correctly on `CANCEL` and on a failing statement. Bind values
+with `vars` as usual — the point is that the statements share a call, not that
+the text is literal.
+
+`connection::begin()` is `= delete`d, and this is the one place the library
+withholds something the C offers. `sr_begin`, `sr_commit` and `sr_cancel` each
+send their *own* single-statement query, and a bare `BEGIN` is parsed and run as
+a complete query — so the transaction opens and closes inside that call, and
+anything issued afterwards is outside it. Measured: begin, write, cancel, and
+the row is still there, with every call reporting success.
+
+A guarantee that silently is not one is worse than no guarantee, so it is a
+compile error with that explanation attached rather than a caveat nobody reads.
+The cost is real: the whole transaction has to be known up front, because there
+is no way to interleave C++ between statements.
+
 ## Records, edges, and patches
 
 Beyond the usual `select` / `create` / `update` / `merge` / `delete`:
@@ -563,6 +557,15 @@ never attached is refused rather than quietly falling back.
 `reset` and `detach` are different on purpose: reset keeps the id valid but
 clears what the session had selected, detach removes it. Both cancel the
 session's live queries — see [Live queries](#live-queries).
+
+To retire a single live query on a session, use `kill_on(session, query_id)`
+rather than writing `KILL` into query text. Both kill the subscription, so
+either works on the database; the difference is that an `rpc` keeps a registry
+of the live queries each session owns, and core only reports a kill to the
+transport when the response carries a uuid — which `KILL` does not, since it
+resolves to `NONE`. `kill_on` carries the id in its own parameters, so the
+registry stays exact. A `KILL` in query text still kills; it just leaves a dead
+entry until the session is torn down.
 
 [ghsa]: https://github.com/surrealdb/surrealdb/security/advisories/GHSA-4vgr-h27g-cf9p
 
@@ -846,6 +849,12 @@ rather than through a generator.
 - A **C++17** compiler. That is the floor, not the target: see
   [Standards](#standards).
 - [surrealdb.c](https://github.com/surrealdb/surrealdb.c) **v0.3.2 or newer** —
+  currently anchored to a development commit on its `0.3-dev` branch rather than
+  a tag, because that commit points its own dependency at a fork of SurrealDB
+  carrying the live-query fixes in
+  [surrealdb/surrealdb#7527](https://github.com/surrealdb/surrealdb/pull/7527).
+  When that PR lands and a release carries it, the anchor moves back to a tag.
+  
   found automatically, or cloned if missing. The floor is asserted twice: at
   configure time when the header can be located, and by a `static_assert` in
   `detail/c_api.hpp` that fires wherever the headers come from. Building against

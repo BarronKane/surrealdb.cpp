@@ -177,47 +177,62 @@ void test_errors_are_reported() {
     }
 }
 
-void test_transaction_commit() {
-    std::printf("transaction: commit\n");
-    auto db = open();
-    if (!db.valid()) return;
-
-    auto tx = db.begin();
-    CHECK(tx.has_value());
-    if (!tx.has_value()) return;
-
-    sdb::object_builder rec;
-    rec.set("v", 1);
-    CHECK(db.create_discarding("tx_tbl:kept", rec).has_value());
-
-    auto t = std::move(tx).value();
-    CHECK(t.active());
-    CHECK(t.commit().has_value());
-    CHECK(!t.active());
-    // Committing twice is a no-op rather than an error.
-    CHECK(t.commit().has_value());
+// Transactions, through the only spelling that scopes.
+//
+// `db.begin()` is `= delete`d: sr_begin sends its own one-statement query, so
+// the transaction opens and closes inside that call and a later write is not in
+// it. Measured -- begin, write, cancel, and the row survives, with every call
+// reporting success. Statements have to share a query instead.
+int table_rows(sdb::connection& db, const char* table) {
+    auto r = db.select(table);
+    if (!r) return -1;
+    return sdb::view(r.value()).size();
 }
 
-void test_transaction_cancels_on_scope_exit() {
-    std::printf("transaction: cancels when it falls out of scope\n");
+void test_transaction_commit() {
+    std::printf("transaction: COMMIT in one query persists\n");
     auto db = open();
     if (!db.valid()) return;
+    (void)db.query("DEFINE TABLE tx_c SCHEMALESS");
+    (void)db.query("DELETE tx_c");
 
-    {
-        auto tx = db.begin();
-        if (!tx.has_value()) return;
-        auto t = std::move(tx).value();
-        CHECK(t.active());
+    auto r = db.query("BEGIN; CREATE tx_c:a SET v = 1; CREATE tx_c:b SET v = 2; COMMIT;");
+    CHECK(r.has_value());
+    CHECK(table_rows(db, "tx_c") == 2);
+}
 
-        sdb::object_builder rec;
-        rec.set("v", 2);
-        (void)db.create_discarding("tx_tbl:dropped", rec);
+void test_transaction_cancel_rolls_back() {
+    std::printf("transaction: CANCEL in one query rolls back\n");
+    auto db = open();
+    if (!db.valid()) return;
+    (void)db.query("DEFINE TABLE tx_r SCHEMALESS");
+    (void)db.query("DELETE tx_r");
 
-        // No commit: leaving the scope cancels. This is the whole point of the
-        // guard -- an early return cannot leave a transaction open.
-    }
+    auto r = db.query("BEGIN; CREATE tx_r:a SET v = 1; CANCEL;");
+    CHECK(r.has_value());
+    CHECK(table_rows(db, "tx_r") == 0);
+}
 
-    CHECK(db.health().has_value());
+// The shape that looks like it works and does not.
+//
+// Kept as a test rather than a comment because it is the thing a reader will
+// reach for first, and because if the C ever holds a transaction open across
+// calls this starts failing -- which is the signal to un-delete begin().
+void test_separate_calls_do_not_scope() {
+    std::printf("transaction: separate calls are not scoped\n");
+    auto db = open();
+    if (!db.valid()) return;
+    (void)db.query("DEFINE TABLE tx_s SCHEMALESS");
+    (void)db.query("DELETE tx_s");
+
+    CHECK(db.query("BEGIN;").has_value());
+    sdb::object_builder rec;
+    rec.set("v", 1);
+    CHECK(db.create_discarding("tx_s:a", rec).has_value());
+    CHECK(db.query("CANCEL;").has_value());
+
+    // Not rolled back: the BEGIN's transaction ended with its own query.
+    CHECK(table_rows(db, "tx_s") == 1);
 }
 
 void test_auth_surface() {
@@ -330,7 +345,8 @@ int main() {
     test_variables();
     test_errors_are_reported();
     test_transaction_commit();
-    test_transaction_cancels_on_scope_exit();
+    test_transaction_cancel_rolls_back();
+    test_separate_calls_do_not_scope();
     test_auth_surface();
     test_record_auth_with_params();
 

@@ -60,9 +60,13 @@ class connection;
 
 /// A transaction that cancels itself unless committed.
 ///
-/// This is the one place where scope really is the semantic: an early return,
-/// or any path that forgets to commit, cancels rather than leaving the
-/// transaction open. Move-only, and inert once committed or cancelled.
+/// **Nothing can construct one of these at present.** `connection::begin()` is
+/// `= delete`d, because the C's `sr_begin` sends its own one-statement query
+/// and so opens and closes a transaction before anything else can join it --
+/// see that member for the measurement and for the spelling that does work.
+///
+/// Kept rather than removed: the shape is right, and it becomes correct the
+/// moment the C can hold a transaction open across calls.
 class transaction {
 public:
     transaction(transaction&& other) noexcept
@@ -433,9 +437,7 @@ public:
         sr_stream_t* out = nullptr;
         return track(detail::invoke<stream>(
             [&](sr_string_t* e) { return ::sr_select_live(raw(), e, &out, resource); },
-            [&](int) {
-                return stream(out, raw(), std::weak_ptr<const void>(alive_));
-            }));
+            [&](int) { return stream(out, std::weak_ptr<const void>(alive_)); }));
     }
 
     /// Kill a live query by its id, as reported by `notification::query_id`.
@@ -447,19 +449,24 @@ public:
     /// around, and `REMOVE TABLE` strands a stream the same way, so it is a
     /// property of the path and not of this call.
     ///
-    /// **If you hold a `stream` for the query, you do not need this.**
-    /// `stream::close()` retires the subscription and releases the reader as
-    /// one operation, and the destructor calls it, so scope exit is already
-    /// correct. Calling this as well is redundant rather than wrong -- killing
-    /// an id twice is harmless.
+    /// Both routes retire the subscription, so pick by what you are holding:
     ///
-    /// What it is for is a live query registered *without* a stream: a bare
-    /// `LIVE SELECT` run through `query()`, which answers with the id but hands
-    /// back no reader. That is the case `stream::close()` cannot help with.
+    /// - a `stream` from `live()` -- call `stream::close()`, which frees the
+    ///   reader and retires the query in one step, and needs no id;
+    /// - an id and no stream, such as a bare `LIVE SELECT` run through
+    ///   `query()` -- call this.
     ///
-    /// Note that this call alone leaves any stream on that query open and
-    /// silent -- it stops delivery without ending the stream. `INFO FOR
-    /// TABLE`'s `lives` is where the datastore half is visible.
+    /// Calling both is harmless, just unnecessary. Any stream reading the
+    /// killed subscription is told: it reports its end rather than going quiet.
+    ///
+    /// None of that used to be true. Freeing a reader left the subscription
+    /// registered, and a killed stream stayed open and silent forever, so
+    /// teardown needed both calls and a blocked reader could not be released at
+    /// all. The anchored surrealdb.c carries the fixes; `INFO FOR TABLE`'s
+    /// `lives` is where the datastore half is visible if you want to watch it.
+    ///
+    /// On an `rpc` context, prefer `rpc::kill_on()` over writing `KILL` into
+    /// query text -- see its note.
     [[nodiscard]] result<void> kill(const char* query_id) noexcept {
         return track(detail::invoke([&](sr_string_t* e) {
             return ::sr_kill(raw(), e, query_id);
@@ -495,12 +502,37 @@ public:
 
     // -- transactions -------------------------------------------------------
 
-    /// Begin a transaction. It cancels on scope exit unless committed.
-    [[nodiscard]] result<transaction> begin() noexcept {
-        return track(detail::invoke<transaction>(
-            [&](sr_string_t* e) { return ::sr_begin(raw(), e); },
-            [&](int) { return transaction(raw()); }));
-    }
+    /// Withheld: `sr_begin` does not open a transaction you can write into.
+    ///
+    /// Each of `sr_begin`, `sr_commit` and `sr_cancel` sends its own
+    /// single-statement query, and a `BEGIN` alone is parsed and executed as a
+    /// complete query -- so the transaction opens and closes inside that call
+    /// and nothing issued afterwards is inside it. Measured: begin, write,
+    /// cancel, and the row is still there, with every call reporting success.
+    ///
+    /// That is the worst failure shape available -- not an error, but a
+    /// guarantee that silently is not one -- so it is a compile error here
+    /// rather than a comment nobody reads.
+    ///
+    /// **Transactions do work. They have to share one query:**
+    ///
+    ///     db.query("BEGIN;"
+    ///              "CREATE account:a SET balance = 100;"
+    ///              "UPDATE account:b SET balance += 100;"
+    ///              "COMMIT;");
+    ///
+    /// That rolls back correctly on `CANCEL` and on a failing statement, which
+    /// is also measured. The cost is that the whole transaction must be known
+    /// up front, since there is no way to interleave C++ between statements.
+    ///
+    /// Bind values with `vars` as usual -- the point is that the statements
+    /// share a call, not that the text is literal.
+    result<transaction> begin()
+        SURREALDB_DELETED("sr_begin sends its own one-statement query, so the "
+                          "transaction ends before the next call starts and "
+                          "nothing between begin and commit is scoped. Put the "
+                          "whole transaction in one query: "
+                          "db.query(\"BEGIN; ...; COMMIT;\").");
 
     // -- import / export ----------------------------------------------------
 

@@ -95,24 +95,28 @@ static_assert(SR_VERSION >= SR_VERSION_ENCODE(SURREALDB_CPP_REQUIRES_C_MAJOR,
 // This one describes the *dependency*, so it lives here where `SR_VERSION` is
 // visible.
 //
-// `sr_stream_next` blocks with no bound. Against SurrealDB 3.2.4 a killed live
-// query never reports its end, so a reader parked in it cannot be released by
-// anything short of ending the process -- surrealdb.c restored the symbol in
-// 0.3.2 while advising against it, and this library refuses to compile the call
-// at all. `stream::next()` and stream iteration are `= delete`d on this.
+// `sr_stream_next` blocks with no bound. That was unusable for two releases:
+// a killed live query never reported its end, so a reader parked in it could
+// not be released by anything short of ending the process. `stream::next()` and
+// stream iteration were `= delete`d on this flag.
 //
-// Pinned to a version rather than probed, because there is nothing to probe:
-// the defect is in the Rust dependency surrealdb.c pins, not in any symbol or
-// macro the C header exposes. Move it when surrealdb.c bumps past
-// surrealdb/surrealdb#7520, and the deleted members come back with it.
-#define SURREALDB_HAS_UNBOUNDED_STREAM_READ 0
+// The anchored surrealdb.c now carries the live-query teardown fixes, so `KILL`
+// and `REMOVE TABLE` end a stream and the parked reader returns. The flag is on
+// and both members are back.
+//
+// Still pinned to the dependency rather than probed: the fix is in the Rust
+// surrealdb.c builds against, not in any symbol or macro the C header exposes.
+// If the anchor is ever moved back to a published release that lacks it, set
+// this to 0 and the deleted members return with their explanation.
+#define SURREALDB_HAS_UNBOUNDED_STREAM_READ 1
 
 namespace surrealdb {
 
-/// Whether `stream::next()` exists. False while the upstream live-query fix is
-/// outstanding; see the note above. `rpc_stream::next()` is unaffected and is
-/// always available -- that path reads the datastore's broker channel directly
-/// and never passes through the gate that drops the terminal notification.
+/// Whether `stream::next()` and stream iteration exist. False while the
+/// upstream live-query teardown fix was outstanding; see the note above.
+/// `rpc_stream::next()` was never affected -- that path reads the datastore's
+/// broker channel directly and never passed through the gate that dropped the
+/// terminal notification.
 inline constexpr bool has_unbounded_stream_read =
     SURREALDB_HAS_UNBOUNDED_STREAM_READ != 0;
 

@@ -193,10 +193,22 @@ int main() {
             (void)stream_.try_next();
             (void)stream_.query_id();
 
+            // The blocking read is available again.
+            while (auto n = stream_.next()) {
+                if (!n.value()) break;
+                handle(n.value()->action(), n.value()->data());
+            }
+
             // Retires the subscription and releases the reader, in one call.
             stream_.close();
         }
     }
+
+    // -- Transactions: one query --
+    (void)db.query("BEGIN;"
+                   "UPDATE account:a SET balance -= 100;"
+                   "UPDATE account:b SET balance += 100;"
+                   "COMMIT;");
 
     // -- Sessions --
     {
@@ -237,6 +249,7 @@ int main() {
         (void)qrows;
     }
 
+    (void)ctx.kill_on(session, "00000000-0000-4000-8000-000000000000");
     (void)ctx.reset(session);
     (void)ctx.detach(session);
 }

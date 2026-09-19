@@ -180,35 +180,49 @@ public:
         return failed_ ? &failure_ : nullptr;
     }
 
-    /// The unbounded read. Withheld deliberately, not missing.
+    /// Block until the next notification.
     ///
-    /// `sr_stream_next` exists again as of surrealdb.c 0.3.2 -- it was withdrawn
-    /// in 0.3.1 and restored ahead of the upstream fix -- and surrealdb.c's own
-    /// documentation says not to use it against SurrealDB 3.2.4. This library
-    /// takes that one step further and refuses to compile the call, because the
-    /// failure it guards is not a wrong answer but a thread that can only be
-    /// retired by ending the process.
+    /// `nullopt` means the stream ended cleanly. An error result means it
+    /// failed; either way the stream is finished afterwards.
     ///
-    /// The defect is producer-side and precise: `KILL` and `REMOVE TABLE` build
-    /// their terminal notification with the session id unset, and the embedded
-    /// router drops exactly that shape before routing it. Everything below that
-    /// gate already works. `REMOVE TABLE` is the worse half, because no caller
-    /// asked for it -- an unrelated schema change orphans every stream on that
-    /// table, so "only block when an event is coming" is not a discipline a
-    /// caller can keep.
+    /// An unbounded wait cannot time out, so two states suffice here and the
+    /// `optional` stays. `next_for()` is the one that needs a third.
     ///
-    /// `next_for()` replaces it, and a long bound is cheap -- the wait is a real
-    /// timer, so `next_for(std::chrono::hours(1))` costs what blocking for an
-    /// hour would have cost and still returns.
+    /// **This was withheld for two releases and is back.** A killed live query
+    /// used to leave the stream open and silent, so a reader parked here could
+    /// not be released by anything short of ending the process -- nothing
+    /// arrived, `SR_CLOSED` never came, and `sr_stream_kill` frees the very
+    /// stream the reader is borrowing. `KILL` and `REMOVE TABLE` now end the
+    /// stream, so this returns. See `has_unbounded_stream_read`, which is what
+    /// re-opened it.
     ///
-    /// When the floor moves past the fix, `has_unbounded_stream_read` flips and
-    /// this comes back.
-    result<std::optional<notification>> next()
-        SURREALDB_DELETED("the unbounded stream read deadlocks against SurrealDB "
-                          "3.2.4: a killed live query never reports its end, and "
-                          "nothing can release a parked reader. surrealdb.c 0.3.2 "
-                          "restored the symbol but advises against it. Use "
-                          "next_for() with a bound, or try_next().");
+    /// It still cannot wake for anything *other* than the stream. A reader that
+    /// must also notice a shutdown flag wants `next_for()`.
+    [[nodiscard]] result<std::optional<notification>> next() noexcept {
+        if (done_ || !handle_) return std::optional<notification>{};
+
+        sr_notification_t raw{};
+        const int rc = ::sr_stream_next(handle_.get(), &raw);
+
+        if (rc > 0) {
+            remember_id(raw);
+            return std::optional<notification>(notification(raw));
+        }
+
+        // Everything below finishes the stream.
+        done_ = true;
+
+        // `SR_CLOSED` is the clean end. `SR_AGAIN` cannot come back from a
+        // blocking read -- it has nothing to report until it has something --
+        // but it is folded in rather than made a failure, because the only
+        // `error` it could produce would carry `error_code::ok`, and an error
+        // that reports itself as ok is worse than a stream that stops.
+        if (rc == SR_CLOSED || rc == SR_AGAIN) return std::optional<notification>{};
+
+        failed_ = true;
+        failure_ = error(static_cast<error_code>(rc), owned_string());
+        return error(static_cast<error_code>(rc), owned_string());
+    }
 
     /// Wait for the next notification, giving up after `timeout`.
     ///
@@ -256,57 +270,23 @@ public:
     /// Retire the live query and release the stream. Safe to call more than
     /// once, and called by the destructor.
     ///
-    /// Tearing a live query down takes two things in the C: `sr_kill` retires
-    /// the subscription in the datastore, and `sr_stream_kill` frees the local
-    /// reader. Neither does the other's job. `sr_stream_kill` *does* route a
-    /// kill through the SDK, but it is `tokio::spawn`ed with its result
-    /// discarded and observably does not land on SurrealDB 3.2.4 -- measured
-    /// with `INFO FOR TABLE`, whose `lives` count is undiminished afterwards.
+    /// One call does both: `sr_stream_kill` retires the subscription in the
+    /// datastore *and* frees the local reader, and it needs no live query id,
+    /// which matters because `db.live()` never hands one back.
     ///
-    /// Leaving that to the caller means two calls that must both happen, which
-    /// is a rule rather than a type. So this does both, and it is the only way
-    /// to close a stream: there is no spelling of this object that releases the
-    /// reader without also retiring the subscription. Scope exit is correct
-    /// too, because the destructor comes here.
+    /// That was not always true. Until the anchored dependency picked up the
+    /// live-query teardown fixes, freeing the reader left the subscription
+    /// registered -- `INFO FOR TABLE`'s `lives` count stayed up -- so tearing
+    /// one down took this *and* `connection::kill()`. This wrapper papered over
+    /// that by issuing the kill itself from a cached id, which also meant a
+    /// stream that had never yielded a notification could not be retired at
+    /// all. Neither is needed now; both are gone.
     ///
-    /// **A stream that has never yielded a notification cannot be retired.**
-    /// `sr_select_live` returns a stream and not an id, and the SDK keeps its
-    /// own copy private, so the id is only learnable from the first
-    /// notification. That is a limitation of the C API, not a choice made here:
-    /// such a query goes when the connection does. `query_id()` says whether
-    /// this stream has one yet.
-    ///
-    /// Best effort by design. It is `noexcept` and reports nothing because the
-    /// destructor calls it; a caller who needs to know the kill landed can
-    /// check `query_id()` and call `connection::kill()` themselves, which is
-    /// harmless to repeat.
+    /// `connection::kill()` covers the other case: a subscription you have an
+    /// id for and no stream, such as a bare `LIVE SELECT` run through
+    /// `query()`. Calling both is harmless, just unnecessary.
     void close() noexcept {
         done_ = true;
-
-        // Retire the subscription first, while the handle is still alive.
-        //
-        // Skipped when the connection is gone: `sr_kill` runs on that
-        // connection's runtime, and the whole reason this class carries a
-        // liveness token is that the runtime dies with it. A leaked
-        // subscription on a dead engine costs nothing anyway -- the engine is
-        // what was holding it.
-        if (have_id_ && db_ != nullptr && !alive_.expired()) {
-            char text[37];
-            static const char* hex = "0123456789abcdef";
-            int w = 0;
-            for (int i = 0; i < 16; ++i) {
-                if (i == 4 || i == 6 || i == 8 || i == 10) text[w++] = '-';
-                text[w++] = hex[(query_id_[i] >> 4) & 0xF];
-                text[w++] = hex[query_id_[i] & 0xF];
-            }
-            text[w] = '\0';
-
-            sr_string_t err = nullptr;
-            (void)::sr_kill(db_, &err, text);
-            if (err != nullptr) ::sr_string_free(err);
-            have_id_ = false;          // retired; do not try again
-        }
-
         if (handle_ && alive_.expired()) {
             (void)handle_.release();   // see the destructor
             return;
@@ -324,41 +304,87 @@ public:
         return uuid_ref{query_id_};
     }
 
-    // -- iteration, withdrawn with the blocking read -------------------------
+    // -- iteration ----------------------------------------------------------
     //
-    // A range cannot express this stream any more, and the failure modes of
-    // pretending otherwise are both bad.
+    // Back with `next()`, and with the same caveat it always had:
     //
-    // An iterator has exactly two answers: here is an element, or the range is
-    // over. A bounded read has three, and the third -- "nothing yet, still
-    // open" -- is the one with nowhere to go. Advancing on a timeout means
-    // looping until something arrives, which is the unbounded park that
-    // surrealdb.c just removed. Ending the range on a timeout means a quiet
-    // moment silently truncates a live query, which is worse: it looks like
-    // success.
+    // **A range-for over a live stream blocks past the last event you know
+    // about.** `for (...; it != end(); ++it)` runs the increment *before*
+    // re-testing the condition, so a loop bounded by a counter in its condition
+    // parks on an event that never comes. A killed query now ends the stream,
+    // so that is a wait rather than the permanent hang it used to be -- but a
+    // healthy quiet stream still parks there indefinitely.
     //
-    // So iteration is deleted rather than quietly redefined. Drive `next_for()`
-    // in a loop and decide for yourself what a run of timeouts means -- that
-    // decision is the caller's and cannot be made here.
+    // Either break from inside the body:
     //
-    // `rpc_stream` keeps its iteration. The RPC path has no such defect: its
-    // stream really does end when the context is destroyed, so `next()` there
-    // still terminates and a range over it still means something.
+    //     for (auto it = s.begin(); it != s.end(); ++it) {
+    //         handle(*it);
+    //         if (enough()) break;
+    //     }
+    //
+    // or drive `next_for()`, which is the honest primitive for a consumer that
+    // decides when to stop. The range is for the worker-thread case that
+    // genuinely wants every event until the stream ends.
 
-    class iterator;   // not defined
+    class iterator {
+    public:
+        using iterator_category = std::input_iterator_tag;
+        using value_type        = notification;
+        using difference_type   = std::ptrdiff_t;
+        using reference         = notification&;
+        using pointer           = notification*;
 
-    iterator begin()
-        SURREALDB_DELETED("a live stream is no longer a range: a bounded read can "
-                          "report 'nothing yet', which an iterator cannot express "
-                          "without either parking forever or silently ending the "
-                          "range. Loop on next_for() instead.");
-    iterator end()
-        SURREALDB_DELETED("a live stream is no longer a range: a bounded read can "
-                          "report 'nothing yet', which an iterator cannot express "
-                          "without either parking forever or silently ending the "
-                          "range. Loop on next_for() instead.");
+        iterator() noexcept = default;
+        explicit iterator(stream* s) noexcept : s_(s) { advance(); }
+
+        [[nodiscard]] reference operator*() noexcept { return current_; }
+        [[nodiscard]] pointer operator->() noexcept { return &current_; }
+
+        iterator& operator++() noexcept { advance(); return *this; }
+        void operator++(int) noexcept { advance(); }
+
+        [[nodiscard]] friend bool operator==(const iterator& a, const iterator& b) noexcept {
+            return a.s_ == b.s_;
+        }
+        [[nodiscard]] friend bool operator!=(const iterator& a, const iterator& b) noexcept {
+            return !(a == b);
+        }
+
+    private:
+        void advance() noexcept {
+            if (!s_) return;
+            auto r = s_->next();
+            if (!r.has_value() || !r.value().has_value()) {
+                s_ = nullptr;          // becomes the end iterator
+                return;
+            }
+            current_ = std::move(r).value().value();
+        }
+
+        stream* s_{nullptr};
+        notification current_;
+    };
+
+    using const_iterator = iterator;
+
+    /// Begins by blocking for the first notification.
+    [[nodiscard]] iterator begin() noexcept { return iterator(this); }
+    [[nodiscard]] iterator end() noexcept { return iterator(); }
 
 private:
+    /// Cache the live query's id off a notification.
+    ///
+    /// The only place the C ever exposes it -- `sr_select_live` hands back a
+    /// stream and no id -- and copied rather than borrowed, because the
+    /// notification it came from is about to be handed away. `close()` no
+    /// longer needs it, but `query_id()` still reports it and a caller may want
+    /// it for `connection::kill()`.
+    void remember_id(const sr_notification_t& n) noexcept {
+        if (have_id_) return;
+        for (int i = 0; i < 16; ++i) query_id_[i] = n.query_id._0[i];
+        have_id_ = true;
+    }
+
     /// The shared body of `next_for` and `try_next`.
     ///
     /// Not public: `int` milliseconds is the C's spelling, where a negative
@@ -372,14 +398,7 @@ private:
         const int rc = ::sr_stream_next_timeout(handle_.get(), &raw, ms);
 
         if (rc > 0) {
-            // The only place the id is ever visible. Cached so `close()` can
-            // retire the subscription without the caller having to have kept
-            // it -- and copied, not borrowed, because the notification it came
-            // from is about to be handed away.
-            if (!have_id_) {
-                for (int i = 0; i < 16; ++i) query_id_[i] = raw.query_id._0[i];
-                have_id_ = true;
-            }
+            remember_id(raw);
             return poll<notification>(notification(raw));
         }
 
@@ -402,17 +421,10 @@ private:
     }
 
     friend class connection;
-    stream(sr_stream_t* raw, const sr_surreal_t* db,
-           std::weak_ptr<const void> alive) noexcept
-        : handle_(raw), db_(db), alive_(std::move(alive)) {}
+    stream(sr_stream_t* raw, std::weak_ptr<const void> alive) noexcept
+        : handle_(raw), alive_(std::move(alive)) {}
 
     owned_stream handle_;
-
-    /// Borrowed, and only dereferenced while `alive_` holds. Needed because
-    /// retiring a subscription is a call on the *connection*, not the stream,
-    /// and `close()` has to do both to stay a single correct operation.
-    const sr_surreal_t* db_{nullptr};
-
     std::weak_ptr<const void> alive_;
 
     /// Copied out of the first notification; see `query_id()`.
