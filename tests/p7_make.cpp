@@ -785,6 +785,49 @@ void test_object_arg_accepts_every_shape() {
     }
 }
 
+// What `object_arg` changed underfoot, pinned so it stays a decision.
+//
+// `create(resource, {})` used to default-construct an empty `object_builder`
+// and send a real empty object, which succeeded. `{}` now converts to a null
+// `object_arg` and the C rejects it. The capability is not gone -- a named
+// empty builder still does what `{}` used to -- but the spelling flipped from
+// quietly creating an id-only record to a loud error, and `{}` reads at least
+// as much like "I forgot the content" as like "a record with no fields".
+//
+// The flip is only acceptable because it is loud. If this ever starts
+// succeeding again, or starts failing silently, this test says so.
+void test_null_content_is_rejected_loudly() {
+    auto db = sdb::connection::connect("memory");
+    if (!db) { std::printf("make: null content (skipped)\n"); return; }
+    std::printf("make: null content is rejected, empty content is not\n");
+
+    auto& c = db.value();
+    CHECK(c.use("p7_ns", "p7_null").has_value());
+
+    // An empty object is still a legal record body -- `CREATE t:x` with no
+    // CONTENT is ordinary SurrealQL, and this is how you spell it now.
+    sdb::object_builder empty;
+    CHECK(c.create("t:empty", empty).has_value());
+
+    // A *missing* object is not, and says so rather than guessing.
+    auto braced = c.create("t:braced", {});
+    CHECK(!braced.has_value());
+    if (!braced) {
+        CHECK(!braced.error().is_fatal());          // recoverable, not poison
+        CHECK(!braced.error().message().empty());   // and it explains itself
+    }
+
+    // `nullptr` is the same thing said out loud. It did not compile at all
+    // before `object_arg`; now it compiles and fails, which is the better of
+    // the two ways to be wrong.
+    CHECK(!c.create("t:nulled", nullptr).has_value());
+
+    // The connection is still usable afterwards -- a rejected argument is not
+    // a dead handle.
+    CHECK(!c.poisoned());
+    CHECK(c.create("t:after", empty).has_value());
+}
+
 // The array half of the same idea: `array_arg` carries the `(ptr, len)` header
 // by value, so an `array_view` off a result reaches a call that wants an array
 // without being rebuilt through a builder.
@@ -855,6 +898,7 @@ int main() {
     test_object_round_trip();
     test_object_arg_accepts_every_shape();
     test_array_arg_accepts_every_shape();
+    test_null_content_is_rejected_loudly();
 
     if (g_db) sr_surreal_disconnect(g_db);
 

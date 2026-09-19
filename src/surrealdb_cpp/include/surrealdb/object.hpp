@@ -241,7 +241,22 @@ private:
 /// outlive the statement, this one is consumed inside it.
 class object_arg {
 public:
-    /// No object. What `create(resource, {})` and an omitted `vars` mean.
+    /// No object at all -- which is not the same as an empty one.
+    ///
+    /// This is what an omitted `vars` or `params` means, and it is the right
+    /// default there. On a call where content is *required* it is an error the
+    /// C reports as "content is null", and two spellings reach it:
+    /// `create(resource, nullptr)`, which says so, and `create(resource, {})`,
+    /// which does not.
+    ///
+    /// **`{}` changed meaning here.** Against the old `const object_builder&`
+    /// it default-constructed an empty builder and quietly created a record
+    /// with nothing but an id; now it is a null argument and fails. The
+    /// capability is intact -- a named empty `object_builder` still does what
+    /// `{}` used to -- and the failure is loud rather than silent, which is why
+    /// the change was allowed to stand. `{}` reads at least as much like a
+    /// forgotten argument as like a deliberate empty record, and the two should
+    /// not have been the same expression.
     object_arg() noexcept = default;
     object_arg(std::nullptr_t) noexcept {}
 

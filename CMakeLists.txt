@@ -16,7 +16,7 @@ if(APPLE AND EXISTS "${_sdb_apple_module}")
     include("${_sdb_apple_module}")
 endif()
 
-project(surrealdb_cpp VERSION 0.1.4 LANGUAGES C CXX)
+project(surrealdb_cpp VERSION 0.1.5 LANGUAGES C CXX)
 
 # ============================================================================
 # Git Submodules
@@ -335,8 +335,9 @@ find_package(surrealdb_c REQUIRED)
 
 # --- minimum surrealdb.c -----------------------------------------------------
 #
-# 0.1.4 calls `sr_session_fork`, `sr_runtime_init`, `sr_rpc_kill_on` and the
-# transaction handle calls (`sr_tx_query`, and the reshaped begin/commit/cancel).
+# 0.1.5 calls `sr_session_fork`, `sr_runtime_init`, `sr_rpc_kill_on`, the
+# transaction handle calls (`sr_tx_query`, and the reshaped begin/commit/cancel),
+# `sr_object_from_entries` and the three non-text record id constructors.
 # `detail/c_api.hpp` static_asserts this and is the real backstop -- it fires
 # wherever the headers come from, including an installed package this module
 # never looked inside. Checking here as well only buys an earlier and more
