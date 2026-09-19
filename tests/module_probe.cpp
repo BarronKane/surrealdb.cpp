@@ -246,10 +246,19 @@ void probe_connection() {
         s.close();
     }
 
-    // Transactions have to share one query -- connection::begin() is
-    // deleted, because sr_begin closes its transaction with its own call.
-    expect(db.query("BEGIN; CREATE probe_tx:a SET v = 1; CANCEL;").has_value(),
-           "transaction in one query");
+    // A real transaction handle: statements across separate calls, scoped
+    // together, cancelled on scope exit unless committed.
+    {
+        auto begun = db.begin();
+        expect(begun.has_value(), "begin");
+        if (begun) {
+            auto tx = std::move(begun).value();
+            expect(tx.active(), "transaction active");
+            expect(tx.query("CREATE probe_tx:a SET v = 1").has_value(), "tx query");
+            expect(tx.cancel().has_value(), "tx cancel");
+            expect(!tx.active(), "transaction consumed");
+        }
+    }
 }
 
 void probe_rpc() {

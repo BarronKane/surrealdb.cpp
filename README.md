@@ -411,32 +411,54 @@ outlive it, the same rule as `array_view`.
 
 ## Transactions
 
-**A transaction has to fit in one query.**
-
 ```cpp
-db.query("BEGIN;"
-         "UPDATE account:a SET balance -= 100;"
-         "UPDATE account:b SET balance += 100;"
-         "COMMIT;");
+auto tx = std::move(db.begin()).value();
+
+if (!tx.query("UPDATE account:a SET balance -= 100")) return;   // cancels
+if (!tx.query("UPDATE account:b SET balance += 100")) return;   // cancels
+
+auto done = tx.commit();
 ```
 
-That rolls back correctly on `CANCEL` and on a failing statement. Bind values
-with `vars` as usual — the point is that the statements share a call, not that
-the text is literal.
+Statements run on the handle are scoped together: nothing they write is visible
+outside until `commit()`, and `cancel()` discards the lot. **It cancels on scope
+exit unless committed** — an early return, or any path that forgets, rolls back.
+That is not a convenience: losing the handle without committing or cancelling
+would leave the transaction open in the datastore holding its locks until it
+timed out, so the destructor is load-bearing.
 
-`connection::begin()` is `= delete`d, and this is the one place the library
-withholds something the C offers. `sr_begin`, `sr_commit` and `sr_cancel` each
-send their *own* single-statement query, and a bare `BEGIN` is parsed and run as
-a complete query — so the transaction opens and closes inside that call, and
-anything issued afterwards is outside it. Measured: begin, write, cancel, and
-the row is still there, with every call reporting success.
+The point of a handle over `BEGIN; ...; COMMIT;` as one query is that **your own
+code runs between statements**. A failing statement does not roll the
+transaction back by itself — the error lands in that statement's slot and you
+decide whether to carry on or cancel. The single-query form still works and is
+the right shape when the whole transaction is known up front.
 
-A guarantee that silently is not one is worse than no guarantee, so it is a
-compile error with that explanation attached rather than a caveat nobody reads.
-The cost is real: the whole transaction has to be known up front, because there
-is no way to interleave C++ between statements.
+A transaction runs on a **forked session**, copied from the connection at
+`begin()`, so it inherits the namespace, database and authentication in force
+then. A later `use()` on the connection does not move a transaction already
+open.
 
-## Records, edges, and patches
+Both `commit()` and `cancel()` consume the handle even when they fail, because a
+failed commit otherwise leaves you holding a pointer that is good for nothing.
+Using one afterwards is reported, not undefined.
+
+<details>
+<summary>This was <code>= delete</code>d for a while, and why</summary>
+
+The C used to send `BEGIN`, `COMMIT` and `CANCEL` each as its own
+single-statement query — and a bare `BEGIN` is a complete query, so the
+transaction opened and closed inside that one call and everything afterwards ran
+outside it. All three returned success. Measured: begin, write, cancel, and the
+row was still there.
+
+A guarantee that silently is not one is worse than no guarantee, so `begin()`
+became a compile error with the measurement attached rather than a caveat nobody
+reads. surrealdb.c now hands back a handle that threads a transaction id through
+every statement, which is what makes any of this real, and the tests assert
+against rows rather than return codes for the same reason.
+</details>
+
+## Records, edges, and patches## Records, edges, and patches
 
 Beyond the usual `select` / `create` / `update` / `merge` / `delete`:
 

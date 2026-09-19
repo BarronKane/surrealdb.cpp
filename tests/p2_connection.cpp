@@ -3,6 +3,7 @@
 #include <surrealdb/surrealdb.hpp>
 
 #include <cstdio>
+#include <optional>
 #include <cstring>
 #include <string>
 
@@ -177,47 +178,244 @@ void test_errors_are_reported() {
     }
 }
 
-// Transactions, through the only spelling that scopes.
+// Transactions.
 //
-// `db.begin()` is `= delete`d: sr_begin sends its own one-statement query, so
-// the transaction opens and closes inside that call and a later write is not in
-// it. Measured -- begin, write, cancel, and the row survives, with every call
-// reporting success. Statements have to share a query instead.
+// These assert against the *database*, not against return codes. The previous
+// implementation returned success from all three calls and scoped nothing, so a
+// suite that only checked return values passed against an API that did not
+// work. Every check here reads rows back.
 int table_rows(sdb::connection& db, const char* table) {
     auto r = db.select(table);
     if (!r) return -1;
     return sdb::view(r.value()).size();
 }
 
-void test_transaction_commit() {
-    std::printf("transaction: COMMIT in one query persists\n");
+sdb::connection tx_db(const char* table) {
     auto db = open();
-    if (!db.valid()) return;
-    (void)db.query("DEFINE TABLE tx_c SCHEMALESS");
-    (void)db.query("DELETE tx_c");
+    if (!db.valid()) return db;
+    char stmt[128];
+    std::snprintf(stmt, sizeof(stmt), "DEFINE TABLE %s SCHEMALESS", table);
+    (void)db.query(stmt);
+    std::snprintf(stmt, sizeof(stmt), "DELETE %s", table);
+    (void)db.query(stmt);
+    return db;
+}
 
-    auto r = db.query("BEGIN; CREATE tx_c:a SET v = 1; CREATE tx_c:b SET v = 2; COMMIT;");
-    CHECK(r.has_value());
-    CHECK(table_rows(db, "tx_c") == 2);
+void test_transaction_commit_persists() {
+    std::printf("transaction: commit persists\n");
+    auto db = tx_db("tx_c");
+    if (!db.valid()) return;
+
+    auto b = db.begin();
+    CHECK(b.has_value());
+    if (!b) return;
+    auto tx = std::move(b).value();
+    CHECK(tx.active());
+
+    CHECK(tx.query("CREATE tx_c:a SET v = 1").has_value());
+    CHECK(tx.commit().has_value());
+    CHECK(!tx.active());
+    CHECK(table_rows(db, "tx_c") == 1);
 }
 
 void test_transaction_cancel_rolls_back() {
-    std::printf("transaction: CANCEL in one query rolls back\n");
-    auto db = open();
+    std::printf("transaction: cancel rolls back\n");
+    auto db = tx_db("tx_r");
     if (!db.valid()) return;
-    (void)db.query("DEFINE TABLE tx_r SCHEMALESS");
-    (void)db.query("DELETE tx_r");
 
-    auto r = db.query("BEGIN; CREATE tx_r:a SET v = 1; CANCEL;");
-    CHECK(r.has_value());
+    auto b = db.begin();
+    if (!b) return;
+    auto tx = std::move(b).value();
+
+    CHECK(tx.query("CREATE tx_r:a SET v = 1").has_value());
+    CHECK(tx.cancel().has_value());
     CHECK(table_rows(db, "tx_r") == 0);
 }
 
-// The shape that looks like it works and does not.
+// The whole point of a handle: work spread over separate calls, with the
+// caller's own code in between, still lands or rolls back together.
+void test_transaction_spans_calls() {
+    std::printf("transaction: spans separate calls atomically\n");
+    auto db = tx_db("tx_s");
+    if (!db.valid()) return;
+
+    auto b = db.begin();
+    if (!b) return;
+    auto tx = std::move(b).value();
+
+    CHECK(tx.query("CREATE tx_s:a SET v = 1").has_value());
+    // Arbitrary caller code between statements -- this is what one big
+    // BEGIN; ...; COMMIT; query cannot do.
+    const int decided = table_rows(db, "tx_s");
+    CHECK(tx.query("CREATE tx_s:b SET v = 2").has_value());
+    CHECK(tx.commit().has_value());
+
+    CHECK(decided == 0);                    // invisible while open
+    CHECK(table_rows(db, "tx_s") == 2);     // both landed together
+}
+
+// Isolation, asserted from outside rather than inferred.
+void test_transaction_is_invisible_until_commit() {
+    std::printf("transaction: uncommitted writes are invisible outside\n");
+    auto db = tx_db("tx_i");
+    if (!db.valid()) return;
+
+    auto b = db.begin();
+    if (!b) return;
+    auto tx = std::move(b).value();
+
+    CHECK(tx.query("CREATE tx_i:a SET v = 1").has_value());
+
+    // The connection that opened it cannot see the write...
+    CHECK(table_rows(db, "tx_i") == 0);
+    // ...but the transaction can.
+    auto inside = tx.query("SELECT * FROM tx_i");
+    CHECK(inside.has_value());
+    if (inside) {
+        auto rows = inside.value().single();
+        CHECK(rows.has_value() && rows.value().size() == 1);
+    }
+
+    CHECK(tx.commit().has_value());
+    CHECK(table_rows(db, "tx_i") == 1);
+}
+
+// Scope exit cancels. This is the guarantee the old implementation advertised
+// and did not have, so it is asserted against rows rather than a flag.
+void test_transaction_cancels_on_scope_exit() {
+    std::printf("transaction: cancels when it falls out of scope\n");
+    auto db = tx_db("tx_x");
+    if (!db.valid()) return;
+
+    {
+        auto b = db.begin();
+        if (!b) return;
+        auto tx = std::move(b).value();
+        CHECK(tx.query("CREATE tx_x:a SET v = 1").has_value());
+        // No commit, no cancel -- an early return is the case this models.
+    }
+
+    CHECK(table_rows(db, "tx_x") == 0);
+}
+
+// A failed statement does not roll the transaction back by itself; the caller
+// decides. That choice is the reason to hold a handle.
+void test_failing_statement_leaves_the_choice() {
+    std::printf("transaction: a failing statement leaves the choice open\n");
+    auto db = tx_db("tx_f");
+    if (!db.valid()) return;
+
+    auto b = db.begin();
+    if (!b) return;
+    auto tx = std::move(b).value();
+
+    CHECK(tx.query("CREATE tx_f:a SET v = 1").has_value());
+
+    // Something the server will reject at runtime.
+    auto bad = tx.query("SELECT * FROM type::table($nope)");
+    (void)bad;   // either channel is acceptable; what matters is what follows
+
+    // The transaction is still usable, and committing keeps the good write.
+    CHECK(tx.active());
+    auto more = tx.query("CREATE tx_f:b SET v = 2");
+    if (more.has_value()) {
+        CHECK(tx.commit().has_value());
+        CHECK(table_rows(db, "tx_f") == 2);
+    } else {
+        CHECK(tx.cancel().has_value());
+        CHECK(table_rows(db, "tx_f") == 0);
+    }
+}
+
+// Both commit and cancel consume the handle, even when they fail -- so a second
+// call has to be reported, not repeated against a freed pointer.
+void test_use_after_completion_is_rejected() {
+    std::printf("transaction: use after completion is rejected\n");
+    auto db = tx_db("tx_u");
+    if (!db.valid()) return;
+
+    auto b = db.begin();
+    if (!b) return;
+    auto tx = std::move(b).value();
+    CHECK(tx.commit().has_value());
+    CHECK(!tx.active());
+
+    auto again = tx.commit();
+    CHECK(!again.has_value());
+    if (!again) CHECK(!again.error().message().empty());
+
+    auto cancelled = tx.cancel();
+    CHECK(!cancelled.has_value());
+
+    auto q = tx.query("CREATE tx_u:a SET v = 1");
+    CHECK(!q.has_value());
+    CHECK(table_rows(db, "tx_u") == 0);
+}
+
+// The transaction runs on a forked session, so it keeps the namespace and
+// database it was opened with even if the connection moves afterwards.
+void test_transaction_session_is_forked() {
+    std::printf("transaction: keeps the session it was opened with\n");
+    auto db = tx_db("tx_k");
+    if (!db.valid()) return;
+
+    auto b = db.begin();
+    if (!b) return;
+    auto tx = std::move(b).value();
+
+    // Move the connection somewhere else entirely.
+    CHECK(db.use("other_ns", "other_db").has_value());
+
+    // The open transaction is unaffected.
+    CHECK(tx.query("CREATE tx_k:a SET v = 1").has_value());
+    CHECK(tx.commit().has_value());
+
+    CHECK(db.use("p2_ns", "p2_db").has_value());
+    CHECK(table_rows(db, "tx_k") == 1);
+}
+
+// A transaction whose connection is gone must not run against a dead runtime.
 //
-// Kept as a test rather than a comment because it is the thing a reader will
-// reach for first, and because if the C ever holds a transaction open across
-// calls this starts failing -- which is the signal to un-delete begin().
+// `commit`, `cancel` and the destructor all go through the connection's tokio
+// runtime, which dies with the last handle onto it. The library holds a
+// liveness token and abandons the transaction rather than touching a freed
+// runtime -- the same trade `stream` makes. The datastore times the
+// transaction out; a use-after-free does not recover.
+//
+// Written because those branches existed with nothing reaching them. Under
+// ASan this is where a mistake would show.
+void test_transaction_outliving_its_connection() {
+    std::printf("transaction: outliving its connection is abandoned, not crashed\n");
+
+    std::optional<sdb::transaction> orphan;
+    {
+        auto made = sdb::connection::connect("memory");
+        CHECK(made.has_value());
+        if (!made) return;
+        auto db = std::move(made).value();
+        CHECK(db.use("p2_ns", "p2_db").has_value());
+        (void)db.query("DEFINE TABLE tx_o SCHEMALESS");
+
+        auto b = db.begin();
+        CHECK(b.has_value());
+        if (!b) return;
+        orphan.emplace(std::move(b).value());
+        CHECK(orphan->query("CREATE tx_o:a SET v = 1").has_value());
+    }   // the connection is destroyed with the transaction still open
+
+    // Every route has to report rather than run.
+    auto q = orphan->query("CREATE tx_o:b SET v = 2");
+    CHECK(!q.has_value());
+
+    auto c = orphan->commit();
+    CHECK(!c.has_value());
+    if (!c) CHECK(c.error().code() == sdb::error_code::closed);
+    CHECK(!orphan->active());
+
+    // And the destructor, below, must not touch the dead runtime either.
+    orphan.reset();
+}
+
 void test_separate_calls_do_not_scope() {
     std::printf("transaction: separate calls are not scoped\n");
     auto db = open();
@@ -344,8 +542,15 @@ int main() {
     test_operations();
     test_variables();
     test_errors_are_reported();
-    test_transaction_commit();
+    test_transaction_commit_persists();
     test_transaction_cancel_rolls_back();
+    test_transaction_spans_calls();
+    test_transaction_is_invisible_until_commit();
+    test_transaction_cancels_on_scope_exit();
+    test_failing_statement_leaves_the_choice();
+    test_use_after_completion_is_rejected();
+    test_transaction_session_is_forked();
+    test_transaction_outliving_its_connection();
     test_separate_calls_do_not_scope();
     test_auth_surface();
     test_record_auth_with_params();

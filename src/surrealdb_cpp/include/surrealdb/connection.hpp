@@ -29,6 +29,7 @@
 #include "value.hpp"
 
 #include <atomic>
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <utility>
@@ -60,37 +61,138 @@ class connection;
 
 /// A transaction that cancels itself unless committed.
 ///
-/// **Nothing can construct one of these at present.** `connection::begin()` is
-/// `= delete`d, because the C's `sr_begin` sends its own one-statement query
-/// and so opens and closes a transaction before anything else can join it --
-/// see that member for the measurement and for the spelling that does work.
+/// Statements run through `query()` are scoped together: nothing they write is
+/// visible outside until `commit()`, and `cancel()` discards the lot. The
+/// handle spans calls, so the caller decides what happens between statements --
+/// which is the whole reason to hold one rather than send `BEGIN; ...; COMMIT;`
+/// as a single query, a form that works but needs the entire transaction known
+/// up front.
 ///
-/// Kept rather than removed: the shape is right, and it becomes correct the
-/// moment the C can hold a transaction open across calls.
+/// **This is the one place where scope really is the semantic.** An early
+/// return, or any path that forgets to commit, cancels. Losing the handle
+/// without doing either would leave the transaction open in the datastore
+/// holding its locks until it timed out, so the destructor is not a
+/// convenience.
+///
+/// It runs on a **forked session**, copied from the connection at `begin()`, so
+/// it inherits the namespace, database and authentication in force then. A
+/// later `use()` on the connection does not move a transaction already open.
+///
+/// Move-only, and inert once committed or cancelled -- both consume the handle
+/// even when they fail, because a failed commit otherwise leaves you holding a
+/// pointer that is good for nothing.
 class transaction {
 public:
+    transaction() noexcept = default;
+
     transaction(transaction&& other) noexcept
-        : db_(other.db_), live_(other.live_) {
-        other.db_ = nullptr;
-        other.live_ = false;
+        : handle_(other.handle_), alive_(std::move(other.alive_)),
+          poisoned_(std::move(other.poisoned_)) {
+        other.handle_ = nullptr;
     }
+    /// Deleted: assigning over a live transaction would have to cancel it, and
+    /// a silent rollback at an assignment is not something to make easy.
     transaction& operator=(transaction&&) = delete;
     transaction(const transaction&) = delete;
     transaction& operator=(const transaction&) = delete;
 
-    ~transaction() { (void)cancel(); }
+    ~transaction() {
+        if (handle_ == nullptr) return;
+        // The handle runs on the connection's runtime. If the connection is
+        // already gone so is that runtime, and cancelling would run against a
+        // dead one -- the same trade `stream` makes, for the same reason. The
+        // datastore times the transaction out; a use-after-free does not
+        // recover.
+        if (alive_.expired()) { handle_ = nullptr; return; }
+        (void)cancel();
+    }
 
-    [[nodiscard]] result<void> commit() noexcept;
-    [[nodiscard]] result<void> cancel() noexcept;
+    /// True until committed or cancelled.
+    [[nodiscard]] bool active() const noexcept { return handle_ != nullptr; }
 
-    [[nodiscard]] bool active() const noexcept { return live_; }
+    /// Run statements inside the transaction.
+    ///
+    /// The same `query_results` `connection::query()` returns, one entry per
+    /// statement -- except that nothing written here is visible outside until
+    /// `commit()`.
+    ///
+    /// **A failing statement does not roll the transaction back.** The error
+    /// lands in that statement's slot and the choice of what to do next is
+    /// yours: carry on, or `cancel()`. That choice is the reason this is a
+    /// handle and not one big query string.
+    [[nodiscard]] result<query_results> query(
+            const char* surql, const object_builder* vars = nullptr) noexcept {
+        if (handle_ == nullptr)
+            return error::local(error_code::error,
+                                "query() on a transaction that was already "
+                                "committed or cancelled");
+        // The same guard `finish()` carries, and for the same reason: this runs
+        // on the connection's runtime, which dies with the last handle onto it.
+        // Omitting it here was a real hole -- the handle stays non-null when a
+        // connection is destroyed, so this would have called into a freed
+        // runtime while every other route reported cleanly.
+        if (alive_.expired())
+            return error::local(error_code::closed,
+                                "the connection this transaction came from is gone");
+        sr_arr_res_t* out = nullptr;
+        return track(detail::invoke<query_results>(
+            [&](sr_string_t* e) {
+                return ::sr_tx_query(handle_, e, &out, surql,
+                                     vars ? vars->raw() : nullptr);
+            },
+            [&](int n) { return query_results(owned_arr_results(out, n)); }));
+    }
+
+    /// Commit, making everything visible together. Consumes the transaction.
+    [[nodiscard]] result<void> commit() noexcept { return finish(&::sr_commit, "commit"); }
+
+    /// Discard everything. Consumes the transaction.
+    [[nodiscard]] result<void> cancel() noexcept { return finish(&::sr_cancel, "cancel"); }
 
 private:
     friend class connection;
-    explicit transaction(const sr_surreal_t* db) noexcept : db_(db), live_(true) {}
+    transaction(sr_transaction_t* raw, std::weak_ptr<const void> alive,
+                std::shared_ptr<std::atomic<bool>> poisoned) noexcept
+        : handle_(raw), alive_(std::move(alive)), poisoned_(std::move(poisoned)) {}
 
-    const sr_surreal_t* db_;
-    bool live_;
+    using finish_fn = int (*)(sr_transaction_t*, sr_string_t*);
+
+    /// Shared by commit and cancel, which differ only in which C call runs.
+    ///
+    /// The handle is cleared *before* the call, because the C consumes it
+    /// whether or not it succeeds -- so a caller who retries a failed commit
+    /// must not reach the same pointer twice.
+    result<void> finish(finish_fn fn, const char* what) noexcept {
+        if (handle_ == nullptr) {
+            char msg[96];
+            std::snprintf(msg, sizeof(msg),
+                          "%s() on a transaction that was already completed", what);
+            return error::local(error_code::error, msg);
+        }
+        sr_transaction_t* h = handle_;
+        handle_ = nullptr;
+
+        if (alive_.expired())
+            return error::local(error_code::closed,
+                                "the connection this transaction came from is gone; "
+                                "it was abandoned rather than run against a dead runtime");
+
+        return track(detail::invoke([&](sr_string_t* e) { return fn(h, e); }));
+    }
+
+    /// Latches the *connection's* poison flag, which this shares -- SR_FATAL
+    /// means the engine is gone, and a transaction on it is no more usable than
+    /// the handle that opened it.
+    template <class T>
+    result<T> track(result<T> r) noexcept {
+        if (!r.has_value() && r.error().is_fatal() && poisoned_)
+            poisoned_->store(true, std::memory_order_release);
+        return r;
+    }
+
+    sr_transaction_t* handle_{nullptr};
+    std::weak_ptr<const void> alive_;
+    std::shared_ptr<std::atomic<bool>> poisoned_;
 };
 
 /// A connection to SurrealDB.
@@ -502,37 +604,38 @@ public:
 
     // -- transactions -------------------------------------------------------
 
-    /// Withheld: `sr_begin` does not open a transaction you can write into.
+    /// Begin a transaction.
     ///
-    /// Each of `sr_begin`, `sr_commit` and `sr_cancel` sends its own
-    /// single-statement query, and a `BEGIN` alone is parsed and executed as a
-    /// complete query -- so the transaction opens and closes inside that call
-    /// and nothing issued afterwards is inside it. Measured: begin, write,
-    /// cancel, and the row is still there, with every call reporting success.
+    /// Statements run on the returned handle are scoped together and stay
+    /// invisible outside it until committed. It cancels on scope exit unless
+    /// you commit, and losing it without doing either would leave the
+    /// transaction open in the datastore holding its locks -- so let it own its
+    /// scope.
     ///
-    /// That is the worst failure shape available -- not an error, but a
-    /// guarantee that silently is not one -- so it is a compile error here
-    /// rather than a comment nobody reads.
+    ///     auto tx = std::move(db.begin()).value();
+    ///     if (!tx.query("UPDATE account:a SET bal -= 10")) return;   // cancels
+    ///     if (!tx.query("UPDATE account:b SET bal += 10")) return;   // cancels
+    ///     auto done = tx.commit();
     ///
-    /// **Transactions do work. They have to share one query:**
+    /// This was `= delete`d for a while, and the reason is worth keeping: the C
+    /// used to send `BEGIN`, `COMMIT` and `CANCEL` each as its own
+    /// single-statement query, and a bare `BEGIN` is a complete query -- so the
+    /// transaction opened and closed inside that one call and nothing after it
+    /// was scoped, with every call still reporting success. It now carries a
+    /// handle that threads a transaction id through each statement, which is
+    /// what makes any of this real.
     ///
-    ///     db.query("BEGIN;"
-    ///              "CREATE account:a SET balance = 100;"
-    ///              "UPDATE account:b SET balance += 100;"
-    ///              "COMMIT;");
-    ///
-    /// That rolls back correctly on `CANCEL` and on a failing statement, which
-    /// is also measured. The cost is that the whole transaction must be known
-    /// up front, since there is no way to interleave C++ between statements.
-    ///
-    /// Bind values with `vars` as usual -- the point is that the statements
-    /// share a call, not that the text is literal.
-    result<transaction> begin()
-        SURREALDB_DELETED("sr_begin sends its own one-statement query, so the "
-                          "transaction ends before the next call starts and "
-                          "nothing between begin and commit is scoped. Put the "
-                          "whole transaction in one query: "
-                          "db.query(\"BEGIN; ...; COMMIT;\").");
+    /// The transaction runs on a forked session and inherits this connection's
+    /// namespace, database and authentication as they are *now*; a later
+    /// `use()` here does not move it.
+    [[nodiscard]] result<transaction> begin() noexcept {
+        sr_transaction_t* out = nullptr;
+        return track(detail::invoke<transaction>(
+            [&](sr_string_t* e) { return ::sr_begin(raw(), e, &out); },
+            [&](int) {
+                return transaction(out, std::weak_ptr<const void>(alive_), poisoned_);
+            }));
+    }
 
     // -- import / export ----------------------------------------------------
 
@@ -645,17 +748,5 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-
-inline result<void> transaction::commit() noexcept {
-    if (!live_) return ok();
-    live_ = false;
-    return detail::invoke([&](sr_string_t* e) { return ::sr_commit(db_, e); });
-}
-
-inline result<void> transaction::cancel() noexcept {
-    if (!live_) return ok();
-    live_ = false;
-    return detail::invoke([&](sr_string_t* e) { return ::sr_cancel(db_, e); });
-}
 
 } // namespace surrealdb

@@ -204,11 +204,17 @@ int main() {
         }
     }
 
-    // -- Transactions: one query --
-    (void)db.query("BEGIN;"
-                   "UPDATE account:a SET balance -= 100;"
-                   "UPDATE account:b SET balance += 100;"
-                   "COMMIT;");
+    // -- Transactions --
+    //
+    // In a void lambda so the README's bare `return` transcribes literally;
+    // the point of the snippet is that an early return cancels.
+    [&] {
+        auto tx = std::move(db.begin()).value();
+        if (!tx.query("UPDATE account:a SET balance -= 100")) return;
+        if (!tx.query("UPDATE account:b SET balance += 100")) return;
+        auto done = tx.commit();
+        (void)done;
+    }();
 
     // -- Sessions --
     {

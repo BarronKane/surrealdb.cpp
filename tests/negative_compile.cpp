@@ -115,17 +115,14 @@ int main() {
         (void)n;
     }
 
-#elif SURREALDB_NEG_CASE == 9
-    // connection::begin(). sr_begin sends its own one-statement query, so the
-    // transaction closes before the next call and nothing after it is scoped --
-    // measured, with every call reporting success. Transactions must share one
-    // query; see the member's note.
-    auto tx = db.begin();
-    (void)tx;
-
-// Cases 10 and 11 are retired.
+// Cases 9, 10 and 11 are retired.
 //
-// They guarded `stream::next()` and stream iteration while the unbounded read
+// 9 guarded `connection::begin()` while the C's transaction calls each sent
+// their own one-statement query and scoped nothing. surrealdb.c now hands back
+// a handle that threads a transaction id through every statement, so begin()
+// is real and the case would compile.
+//
+// 10 and 11 guarded `stream::next()` and stream iteration while the unbounded read
 // deadlocked against a killed live query. The anchored surrealdb.c carries the
 // teardown fixes, so both members are back and the cases would now compile --
 // which as WILL_FAIL tests means they would fail. Removed rather than left

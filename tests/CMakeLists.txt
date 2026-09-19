@@ -177,7 +177,7 @@ endif()
 #
 # Case 0 is the control. It must build, which is what stops a typo in the file
 # from making every other case "fail to compile" for the wrong reason.
-set(SURREALDB_CPP_NEG_CASES 0 1 2 4 5 6 7 8 9)   # 3 unguardable, 10/11 retired; see the file
+set(SURREALDB_CPP_NEG_CASES 0 1 2 4 5 6 7 8)   # 3 unguardable, 9-11 retired; see the file
 
 foreach(_case IN LISTS SURREALDB_CPP_NEG_CASES)
     set(_neg surrealdb_cpp_neg_${_case})
