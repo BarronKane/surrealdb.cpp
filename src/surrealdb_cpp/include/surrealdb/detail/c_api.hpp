@@ -53,8 +53,9 @@ extern "C" {
 // Minimum surrealdb.c
 // ---------------------------------------------------------------------------
 //
-// This library calls functions that do not exist in every release -- 0.1.3
-// needs `sr_session_fork`, `sr_runtime_init` and `sr_rpc_kill_on` --
+// This library calls functions that do not exist in every release -- 0.1.4
+// needs `sr_session_fork`, `sr_runtime_init`, `sr_rpc_kill_on` and the
+// transaction handle API --
 // and building against an older header does not fail anywhere useful. It fails
 // as an undeclared identifier partway down a header the user did not write, or,
 // if the declaration happens to exist but the symbol does not, at the link with
